@@ -1,7 +1,4 @@
-use crate::{
-    app::{App, LastKeyPressAction},
-    dparser,
-};
+use crate::{app::App, dparser, text_buffer::TextBuffer};
 
 /// Returns the corresponding closing character for surrounding a selection,
 /// or `None` if `c` is not a recognised pairing character.
@@ -17,145 +14,284 @@ pub(crate) fn surround_closing_char(c: char) -> Option<char> {
     }
 }
 
-impl<'a> App<'a> {
-    pub(crate) fn handle_char_insertion(&mut self, c: char) -> Option<LastKeyPressAction> {
-        if let Some(closing_annotation) = self.would_overwrite_auto_inserted_closing(c) {
-            log::info!(
-                "Not inserting char '{}' to avoid overwriting auto-inserted closing token",
-                c
-            );
-            closing_annotation.is_auto_inserted = false;
-            self.buffer.move_right();
-        } else {
-            let initial_cursor_pos = self.buffer.cursor_byte_pos();
-            self.buffer.insert_char(c);
-            if let Some((auto_char, auto_pos)) = self.insert_closing_char(c, initial_cursor_pos) {
-                return Some(LastKeyPressAction::InsertedAutoClosing {
-                    char: auto_char,
-                    byte_pos: auto_pos,
-                });
-            }
-        }
-        None
-    }
-
-    pub(crate) fn would_overwrite_auto_inserted_closing(
-        &mut self,
-        c: char,
-    ) -> Option<&mut dparser::ClosingAnnotation> {
-        let cursor_pos = self.buffer.cursor_byte_pos();
-        if cursor_pos == 0 {
-            return None;
-        }
-        if let Some(dparser_token) = self
-            .dparser_tokens_cache
-            .iter_mut()
-            .find(|t| t.token.byte_range().contains(&cursor_pos))
-        {
-            if let Some(dparser::ClosingAnnotation {
-                is_auto_inserted: true,
-                ..
-            }) = &mut dparser_token.annotations.closing
-            {
-                if dparser_token.token.value.starts_with(c) {
-                    return Some(dparser_token.annotations.closing.as_mut().unwrap());
-                }
-            }
-        }
-        None
-    }
-
-    /// After a character `c` has been inserted into the buffer, insert the corresponding
-    /// closing character when `c` is an unmatched opening delimiter.
-    ///
-    /// The decision is made using `dparser_tokens_cache`, which represents the buffer state
-    /// *before* `c` was typed (one character out of date).  The cache is passed to
-    /// [`buffer_format::FormattedBuffer::closing_char_to_insert`] which uses the stale token
-    /// annotations to determine whether `c` opens a new pair or closes an existing one.
-    ///
-    /// Returns the byte position of the auto-inserted closing character, or `None` if no
-    /// closing character was inserted.
-    pub(crate) fn insert_closing_char(
-        &mut self,
-        c: char,
-        initial_cursor_pos: usize,
-    ) -> Option<(char, usize)> {
-        if let Some(closing) = dparser::DParser::closing_char_to_insert(
-            &self.dparser_tokens_cache,
-            c,
-            initial_cursor_pos,
-        ) {
-            self.buffer.insert_char(closing);
-            self.buffer.move_left();
-            // After move_left, cursor is at the start of the auto-inserted closing char.
-            log::info!(
-                "Inserted auto-closing char '{}' at byte position {}",
-                closing,
-                self.buffer.cursor_byte_pos()
-            );
-            Some((closing, self.buffer.cursor_byte_pos()))
-        } else {
-            None
-        }
-    }
-
-    /// Mark the dparser token at `byte_pos` as auto-inserted in the cache.
-    pub(crate) fn mark_auto_inserted_closing(
-        dparser_tokens: &mut [dparser::AnnotatedToken],
-        c: char,
-        byte_pos: usize,
+pub(crate) fn handle_char_insertion(
+    buffer: &mut TextBuffer,
+    dparser_tokens_cache: &mut Vec<dparser::AnnotatedToken>,
+    c: char,
+) {
+    if dparser::DParser::consume_overwritten_auto_inserted_closing(
+        dparser_tokens_cache,
+        c,
+        buffer.cursor_byte_pos(),
     ) {
-        for token in dparser_tokens {
-            if token.token.byte_range().start == byte_pos
-                && token.token.value.starts_with(c)
-                && let Some(dparser::ClosingAnnotation {
-                    is_auto_inserted, ..
-                }) = &mut token.annotations.closing
-            {
-                *is_auto_inserted = true;
-                log::info!(
-                    "Marked token '{}' at byte {} as auto-inserted",
-                    token.token.value,
-                    byte_pos
-                );
-                return;
-            }
-        }
-        log::warn!(
-            "Failed to mark auto-inserted closing char '{}' at byte position {}: no matching token found in cache",
-            c,
-            byte_pos
+        log::info!(
+            "Not inserting char '{}' to avoid overwriting auto-inserted closing token",
+            c
         );
+        buffer.move_right();
+    } else {
+        let inserted_pos = buffer.cursor_byte_pos();
+        buffer.insert_char(c);
+
+        let tokens_after_insertion = dparser::DParser::parse_and_transfer_auto_inserted_flags(
+            buffer.buffer(),
+            dparser_tokens_cache,
+        );
+
+        if let Some(closing) = dparser::DParser::closing_char_to_insert_after_insertion(
+            &tokens_after_insertion,
+            c,
+            inserted_pos,
+        ) {
+            buffer.insert_char(closing);
+            buffer.move_left();
+            let closing_pos = buffer.cursor_byte_pos();
+            let mut final_tokens = dparser::DParser::parse_and_transfer_auto_inserted_flags(
+                buffer.buffer(),
+                &tokens_after_insertion,
+            );
+
+            if dparser::DParser::mark_auto_inserted_closing(&mut final_tokens, closing, closing_pos)
+            {
+                log::info!(
+                    "Inserted auto-closing char '{}' at byte position {}",
+                    closing,
+                    closing_pos
+                );
+            } else {
+                log::warn!(
+                    "Inserted auto-closing char '{}' at byte position {}, but failed to mark it in dparser cache",
+                    closing,
+                    closing_pos
+                );
+            }
+
+            *dparser_tokens_cache = final_tokens;
+        } else {
+            *dparser_tokens_cache = tokens_after_insertion;
+        }
+    }
+}
+
+/// If the token immediately to the right of the cursor is an auto-inserted closing token
+/// that is paired with the token the cursor is right after, delete it.
+/// This is called before a simple Backspace so that deleting an auto-paired opener also
+/// removes the auto-inserted closer.
+pub(crate) fn delete_auto_inserted_closing_if_present(
+    buffer: &mut TextBuffer,
+    dparser_tokens_cache: &[dparser::AnnotatedToken],
+) {
+    let cursor_pos = buffer.cursor_byte_pos();
+
+    if dparser::DParser::should_delete_auto_inserted_closing(dparser_tokens_cache, cursor_pos) {
+        buffer.delete_right();
+        return;
     }
 
-    /// If the token immediately to the right of the cursor is an auto-inserted closing token
-    /// that is paired with the token the cursor is right after, delete it.
-    /// This is called before a simple Backspace so that deleting an auto-paired opener also
-    /// removes the auto-inserted closer.
+    // Fallback for parser edge cases (notably consecutive `(` that can be tokenized
+    // as arithmetic-command boundaries): if the cursor is directly between `(` and `)`,
+    // delete the right paren first so Backspace removes the innermost pair.
+    if cursor_pos > 0 {
+        let left_char = buffer.buffer()[..cursor_pos].chars().next_back();
+        let right_char = buffer.buffer()[cursor_pos..].chars().next();
+        if left_char == Some('(') && right_char == Some(')') {
+            buffer.delete_right();
+        }
+    }
+}
+
+impl<'a> App<'a> {
+    pub(crate) fn handle_char_insertion(&mut self, c: char) {
+        handle_char_insertion(&mut self.buffer, &mut self.dparser_tokens_cache, c);
+    }
+
     pub(crate) fn delete_auto_inserted_closing_if_present(&mut self) {
-        let cursor_pos = self.buffer.cursor_byte_pos();
-        if cursor_pos == 0 {
-            return;
-        }
+        delete_auto_inserted_closing_if_present(&mut self.buffer, &self.dparser_tokens_cache);
+    }
+}
 
-        // Find the token that ends at cursor_pos (the one about to be deleted by Backspace).
-        let opening_annotation = self
-            .dparser_tokens_cache
-            .iter()
-            .find(|t| t.token.byte_range().contains(&(cursor_pos - 1)))
-            .map(|t| t.annotations.opening.clone());
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::text_buffer::TextBuffer;
 
-        if let Some(Some(dparser::OpeningState::Matched(closing_idx))) = opening_annotation {
-            // Check if the closing token starts immediately at cursor_pos and is auto-inserted.
-            if let Some(closing_token) = self.dparser_tokens_cache.get(closing_idx)
-                && closing_token.token.byte_range().start == cursor_pos
-                && let Some(dparser::ClosingAnnotation {
-                    is_auto_inserted: true,
-                    ..
-                }) = closing_token.annotations.closing
-            {
-                self.buffer.delete_right();
-            }
+    fn parsed(input: &str) -> Vec<dparser::AnnotatedToken> {
+        dparser::DParser::parse_and_annotate(input)
+    }
+
+    #[test]
+    fn parser_driven_quote_autoclose_uses_post_insertion_buffer() {
+        let mut buffer = TextBuffer::new("echo ");
+        let mut tokens = parsed(buffer.buffer());
+
+        handle_char_insertion(&mut buffer, &mut tokens, '"');
+
+        assert_eq!(buffer.buffer(), "echo \"\"");
+        assert_eq!(buffer.cursor_byte_pos(), 6);
+    }
+
+    #[test]
+    fn parser_driven_quote_does_not_autoclose_when_it_closed_an_existing_pair() {
+        let mut buffer = TextBuffer::new("echo \"hello");
+        let mut tokens = parsed(buffer.buffer());
+
+        handle_char_insertion(&mut buffer, &mut tokens, '"');
+
+        assert_eq!(buffer.buffer(), "echo \"hello\"");
+        assert_eq!(buffer.cursor_byte_pos(), 12);
+    }
+
+    #[test]
+    fn parser_driven_dollar_expansion_inside_double_quotes_still_autocloses() {
+        let mut buffer = TextBuffer::new("\"$\"");
+        let mut tokens = parsed(buffer.buffer());
+        buffer.move_left();
+
+        handle_char_insertion(&mut buffer, &mut tokens, '(');
+
+        assert_eq!(buffer.buffer(), "\"$()\"");
+        assert_eq!(buffer.cursor_byte_pos(), 3);
+    }
+
+    #[test]
+    fn consume_overwritten_auto_inserted_closing_clears_flag_without_reparsing() {
+        let mut buffer = TextBuffer::new("echo ");
+        let mut tokens = parsed(buffer.buffer());
+
+        handle_char_insertion(&mut buffer, &mut tokens, '"');
+        assert_eq!(buffer.buffer(), "echo \"\"");
+        assert_eq!(buffer.cursor_byte_pos(), 6);
+
+        handle_char_insertion(&mut buffer, &mut tokens, '"');
+        assert_eq!(buffer.buffer(), "echo \"\"");
+        assert_eq!(buffer.cursor_byte_pos(), 7);
+    }
+
+    #[test]
+    fn delete_helper_detects_matching_auto_inserted_closing() {
+        let mut buffer = TextBuffer::new("echo ");
+        let mut tokens = parsed(buffer.buffer());
+
+        handle_char_insertion(&mut buffer, &mut tokens, '"');
+        assert_eq!(buffer.buffer(), "echo \"\"");
+        assert_eq!(buffer.cursor_byte_pos(), 6);
+
+        delete_auto_inserted_closing_if_present(&mut buffer, &tokens);
+        assert_eq!(buffer.buffer(), "echo \"");
+        assert_eq!(buffer.cursor_byte_pos(), 6);
+
+        let mut no_pair_buffer = TextBuffer::new("echo \"");
+        let no_pair_tokens = parsed(no_pair_buffer.buffer());
+        delete_auto_inserted_closing_if_present(&mut no_pair_buffer, &no_pair_tokens);
+        assert_eq!(no_pair_buffer.buffer(), "echo \"");
+    }
+
+    #[test]
+    fn inserting_opening_quote_inserts_closing_and_positions_cursor_inside() {
+        let mut buffer = TextBuffer::new("echo ");
+        let mut tokens = parsed(buffer.buffer());
+
+        handle_char_insertion(&mut buffer, &mut tokens, '"');
+
+        assert_eq!(buffer.buffer(), "echo \"\"");
+        assert_eq!(buffer.cursor_byte_pos(), 6);
+    }
+
+    #[test]
+    fn inserting_closing_quote_over_auto_inserted_one_moves_cursor_without_duplicating() {
+        let mut buffer = TextBuffer::new("echo ");
+        let mut tokens = parsed(buffer.buffer());
+
+        handle_char_insertion(&mut buffer, &mut tokens, '"');
+        assert_eq!(buffer.buffer(), "echo \"\"");
+        assert_eq!(buffer.cursor_byte_pos(), 6);
+
+        handle_char_insertion(&mut buffer, &mut tokens, '"');
+        assert_eq!(buffer.buffer(), "echo \"\"");
+        assert_eq!(buffer.cursor_byte_pos(), 7);
+    }
+
+    #[test]
+    fn backspace_on_opener_also_removes_auto_inserted_closer() {
+        let mut buffer = TextBuffer::new("echo ");
+        let mut tokens = parsed(buffer.buffer());
+
+        handle_char_insertion(&mut buffer, &mut tokens, '"');
+        assert_eq!(buffer.buffer(), "echo \"\"");
+
+        delete_auto_inserted_closing_if_present(&mut buffer, &tokens);
+        buffer.delete_left();
+        let tokens =
+            dparser::DParser::parse_and_transfer_auto_inserted_flags(buffer.buffer(), &tokens);
+
+        assert_eq!(buffer.buffer(), "echo ");
+        assert_eq!(buffer.cursor_byte_pos(), 5);
+        let _ = tokens;
+    }
+
+    #[test]
+    fn single_quote_inside_cmdsubst_inside_double_quote_autocloses() {
+        let mut buffer = TextBuffer::new("echo \"$(echo foo  )\"");
+        buffer.move_left();
+        buffer.move_left();
+        buffer.move_left();
+        let mut tokens = parsed(buffer.buffer());
+
+        handle_char_insertion(&mut buffer, &mut tokens, '\'');
+
+        assert_eq!(buffer.buffer(), "echo \"$(echo foo '' )\"");
+        assert_eq!(buffer.cursor_byte_pos(), 18);
+    }
+
+    #[test]
+    fn single_quote_inside_nested_cmdsubst_inside_double_quote_autocloses() {
+        let mut buffer = TextBuffer::new("echo \"$($(echo foo  ))\"");
+        let insertion_pos = buffer
+            .buffer()
+            .find("  ))\"")
+            .expect("fixture should contain the nested cmdsubst tail")
+            + 1;
+        buffer.move_to_start();
+        while buffer.cursor_byte_pos() < insertion_pos {
+            buffer.move_right();
         }
+        let mut tokens = parsed(buffer.buffer());
+
+        handle_char_insertion(&mut buffer, &mut tokens, '\'');
+
+        assert_eq!(buffer.buffer(), "echo \"$($(echo foo '' ))\"");
+        assert_eq!(buffer.cursor_byte_pos(), insertion_pos + 1);
+    }
+
+    #[test]
+    fn repeated_backspace_on_nested_auto_inserted_parens_removes_inner_pair_each_time() {
+        let mut buffer = TextBuffer::new("");
+        let mut tokens = parsed(buffer.buffer());
+
+        handle_char_insertion(&mut buffer, &mut tokens, '(');
+        handle_char_insertion(&mut buffer, &mut tokens, '(');
+        handle_char_insertion(&mut buffer, &mut tokens, '(');
+        assert_eq!(buffer.buffer(), "((()))");
+        assert_eq!(buffer.cursor_byte_pos(), 3);
+
+        delete_auto_inserted_closing_if_present(&mut buffer, &tokens);
+        buffer.delete_left();
+        tokens = dparser::DParser::parse_and_transfer_auto_inserted_flags(buffer.buffer(), &tokens);
+        assert_eq!(buffer.buffer(), "(())");
+        assert_eq!(buffer.cursor_byte_pos(), 2);
+
+        delete_auto_inserted_closing_if_present(&mut buffer, &tokens);
+        buffer.delete_left();
+        tokens = dparser::DParser::parse_and_transfer_auto_inserted_flags(buffer.buffer(), &tokens);
+        assert_eq!(buffer.buffer(), "()");
+        assert_eq!(buffer.cursor_byte_pos(), 1);
+
+        delete_auto_inserted_closing_if_present(&mut buffer, &tokens);
+        buffer.delete_left();
+        tokens = dparser::DParser::parse_and_transfer_auto_inserted_flags(buffer.buffer(), &tokens);
+        assert_eq!(buffer.buffer(), "");
+        assert_eq!(buffer.cursor_byte_pos(), 0);
+
+        let _ = tokens;
     }
 }

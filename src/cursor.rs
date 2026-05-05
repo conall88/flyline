@@ -179,21 +179,16 @@ pub enum CursorEffect {
 }
 
 /// How the cursor should be styled.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum CursorStyleConfig {
     /// Default: an intensity-modulated grey/white block (original flyline cursor).
+    #[default]
     Default,
     /// Reverse the colours of the cell under the cursor.
     Reverse,
     /// Apply a custom ratatui style.  A single colour (no `on`) is treated as
     /// the background colour; `"pink on white"` → fg=pink, bg=white.
     Custom(ratatui::style::Style),
-}
-
-impl Default for CursorStyleConfig {
-    fn default() -> Self {
-        CursorStyleConfig::Default
-    }
 }
 
 /// Complete cursor configuration set by `flyline set-cursor`.

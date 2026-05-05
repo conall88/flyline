@@ -2,6 +2,8 @@ use flash::lexer::{Lexer, Token, TokenKind};
 use std::collections::VecDeque;
 use std::ops::{Range, RangeInclusive};
 
+use crate::app::auto_close::surround_closing_char;
+
 pub fn collect_tokens_include_whitespace(input: &str) -> Vec<Token> {
     let mut lexer = Lexer::new(input);
     let mut tokens = Vec::new();
@@ -126,6 +128,52 @@ impl DParser {
         self.tokens
     }
 
+    pub fn parse_and_annotate(input: &str) -> Vec<AnnotatedToken> {
+        let mut parser = DParser::from(input);
+        parser.walk_to_end();
+        parser.into_tokens()
+    }
+
+    pub fn parse_and_transfer_auto_inserted_flags(
+        input: &str,
+        old_tokens: &[AnnotatedToken],
+    ) -> Vec<AnnotatedToken> {
+        let mut new_tokens = Self::parse_and_annotate(input);
+
+        // Go from the left while we see identical tokens and mark any closing tokens in new_tokens as auto-inserted if the corresponding token in old_tokens was auto-inserted.
+        for (old, new) in old_tokens.iter().zip(new_tokens.iter_mut()) {
+            if old.token.kind != new.token.kind || old.token.value != new.token.value {
+                break;
+            }
+            if let Some(ClosingAnnotation {
+                opening_idx: old_opening_idx,
+                is_auto_inserted: true,
+            }) = &old.annotations.closing
+                && let Some(new_closing) = &mut new.annotations.closing
+                && *old_opening_idx == new_closing.opening_idx
+            {
+                new_closing.is_auto_inserted = true;
+            }
+        }
+
+        // Go from the right while we see identical tokens and do the same.
+        for (old, new) in old_tokens.iter().rev().zip(new_tokens.iter_mut().rev()) {
+            if old.token.kind != new.token.kind || old.token.value != new.token.value {
+                break;
+            }
+            if let Some(ClosingAnnotation {
+                is_auto_inserted: true,
+                ..
+            }) = &old.annotations.closing
+                && let Some(new_closing) = &mut new.annotations.closing
+            {
+                new_closing.is_auto_inserted = true;
+            }
+        }
+
+        new_tokens
+    }
+
     fn nested_opening_satisfied(
         token: &Token,
         current_nesting: Option<&TokenKind>,
@@ -159,6 +207,7 @@ impl DParser {
             (TokenKind::RBrace, TokenKind::ParamExpansion) => true,
             (TokenKind::RBrace, TokenKind::LBrace) => true,
             (TokenKind::DoubleRParen, TokenKind::ArithSubst) => true,
+            (TokenKind::DoubleRParen, TokenKind::ArithCommand) => true,
             (TokenKind::Backtick, TokenKind::Backtick) => true,
             (TokenKind::DoubleRBracket, TokenKind::DoubleLBracket) => true,
             (TokenKind::Quote, TokenKind::Quote) => true,
@@ -203,8 +252,10 @@ impl DParser {
             // When closing an ArithSubst, two consecutive ) tokens are required.
             // Merge them into a single DoubleRParen by modifying self.tokens[idx] in place
             // and removing the second ) from the vector.
-            if nestings.last().map(|(_, k)| k) == Some(&TokenKind::ArithSubst)
-                && self.tokens[idx].token.kind == TokenKind::RParen
+            if matches!(
+                nestings.last().map(|(_, k)| k),
+                Some(TokenKind::ArithSubst | TokenKind::ArithCommand)
+            ) && self.tokens[idx].token.kind == TokenKind::RParen
                 && idx + 1 < self.tokens.len()
                 && self.tokens[idx + 1].token.kind == TokenKind::RParen
             {
@@ -598,23 +649,163 @@ impl DParser {
             .join("")
     }
 
+    fn is_inside_matched_quote(
+        tokens: &[AnnotatedToken],
+        opener_kind: TokenKind,
+        byte_pos: usize,
+    ) -> bool {
+        tokens.iter().any(|t| {
+            if let Some(OpeningState::Matched(close_idx)) = t.annotations.opening {
+                if t.token.kind == opener_kind {
+                    let open_end = t.token.byte_range().end;
+                    let close_start = tokens[close_idx].token.byte_range().start;
+                    return open_end <= byte_pos && byte_pos <= close_start;
+                }
+            }
+            false
+        })
+    }
+
+    /// Returns `true` if `byte_pos` falls inside a matched `$(...)` or backtick
+    /// command-substitution. `$()` and backticks reset the quoting context, so
+    /// callers can use this to decide that the outer double-quote restriction
+    /// does not apply.
+    fn is_inside_cmdsubst_or_backtick(tokens: &[AnnotatedToken], byte_pos: usize) -> bool {
+        tokens.iter().any(|t| {
+            if let Some(OpeningState::Matched(close_idx)) = t.annotations.opening {
+                if matches!(t.token.kind, TokenKind::CmdSubst | TokenKind::Backtick) {
+                    let open_end = t.token.byte_range().end;
+                    let close_start = tokens[close_idx].token.byte_range().start;
+                    return open_end <= byte_pos && byte_pos <= close_start;
+                }
+            }
+            false
+        })
+    }
+
+    pub fn consume_overwritten_auto_inserted_closing(
+        tokens: &mut [AnnotatedToken],
+        c: char,
+        cursor_pos: usize,
+    ) -> bool {
+        if cursor_pos == 0 {
+            return false;
+        }
+
+        if let Some(dparser_token) = tokens
+            .iter_mut()
+            .find(|t| t.token.byte_range().contains(&cursor_pos))
+            && let Some(closing) = dparser_token.annotations.closing.as_mut()
+            && closing.is_auto_inserted
+            && dparser_token.token.value.starts_with(c)
+        {
+            closing.is_auto_inserted = false;
+            return true;
+        }
+
+        false
+    }
+
+    pub fn should_delete_auto_inserted_closing(
+        tokens: &[AnnotatedToken],
+        cursor_pos: usize,
+    ) -> bool {
+        if cursor_pos == 0 {
+            return false;
+        }
+
+        let Some(opening_token) = tokens
+            .iter()
+            .find(|t| t.token.byte_range().contains(&(cursor_pos - 1)))
+        else {
+            return false;
+        };
+
+        if let Some(OpeningState::Matched(closing_idx)) = opening_token.annotations.opening {
+            return tokens.get(closing_idx).is_some_and(|closing_token| {
+                let is_empty_arith_command_pair = opening_token.token.kind
+                    == TokenKind::ArithCommand
+                    && opening_token.token.byte_range().end == cursor_pos
+                    && matches!(
+                        closing_token.token.kind,
+                        TokenKind::DoubleRParen | TokenKind::RParen
+                    )
+                    && closing_token.token.value.starts_with(')');
+
+                closing_token.token.byte_range().start == cursor_pos
+                    && (closing_token
+                        .annotations
+                        .closing
+                        .as_ref()
+                        .is_some_and(|closing| closing.is_auto_inserted)
+                        || is_empty_arith_command_pair)
+            });
+        }
+
+        // Fallback for lexer/parser edge cases where no structural opening/closing annotation
+        // is available (e.g. consecutive `(` merged into ArithCommand tokens). If the cursor is
+        // exactly between an opening char and an auto-inserted matching closing token, delete it.
+        let Some(opening_char) = opening_token.token.value.chars().next_back() else {
+            return false;
+        };
+        let Some(expected_closing_char) = surround_closing_char(opening_char) else {
+            return false;
+        };
+
+        opening_token.token.byte_range().end == cursor_pos
+            && tokens.iter().any(|closing_token| {
+                let is_empty_arith_command_pair = opening_token.token.kind
+                    == TokenKind::ArithCommand
+                    && matches!(
+                        closing_token.token.kind,
+                        TokenKind::DoubleRParen | TokenKind::RParen
+                    )
+                    && closing_token.token.value.starts_with(')');
+
+                closing_token.token.byte_range().start == cursor_pos
+                    && closing_token.token.value.starts_with(expected_closing_char)
+                    && (closing_token
+                        .annotations
+                        .closing
+                        .as_ref()
+                        .is_some_and(|closing| closing.is_auto_inserted)
+                        || is_empty_arith_command_pair)
+            })
+    }
+
+    pub fn mark_auto_inserted_closing(
+        tokens: &mut [AnnotatedToken],
+        c: char,
+        byte_pos: usize,
+    ) -> bool {
+        for token in tokens {
+            if token.token.byte_range().start == byte_pos
+                && token.token.value.starts_with(c)
+                && let Some(closing) = &mut token.annotations.closing
+            {
+                closing.is_auto_inserted = true;
+                return true;
+            }
+        }
+
+        false
+    }
+
     /// Returns the closing character that should be automatically inserted after the character `c`
     /// was typed at byte position `just_inserted_pos`.
     ///
-    /// `self` is the **stale** (pre-insertion) formatted buffer — i.e. the state of the buffer
-    /// *before* `c` was typed.  This is `self.formatted_buffer_cache` in `App`.
-    ///
-    /// - `{`, `[`, `(` are unambiguously openers and always produce a closing counterpart.
-    /// - `"`, `'`, `` ` `` are ambiguous: they close when there is already an unmatched opener of
-    ///   the same kind before `just_inserted_pos` in the stale buffer; otherwise they open.
-    /// - Returns `None` when `just_inserted_pos` falls inside an already-matched single- or
-    ///   double-quoted string, or when the character at `just_inserted_pos` in the stale buffer
-    ///   is the start of (or inside) a word token.
-    pub fn closing_char_to_insert(
+    /// `tokens` must come from parsing the buffer *after* `c` was inserted. This lets the caller
+    /// ask dparser whether the freshly inserted character is acting as a new opener or as a
+    /// closer in the current parse state.
+    pub fn closing_char_to_insert_after_insertion(
         tokens: &[AnnotatedToken],
         c: char,
         just_inserted_pos: usize,
     ) -> Option<char> {
+        let Some(default_closing) = surround_closing_char(c) else {
+            return None;
+        };
+
         // Never auto-close inside a comment.
         if tokens.iter().any(|t| {
             t.token
@@ -626,50 +817,46 @@ impl DParser {
             return None;
         }
 
-        // Compute context flags once and reuse throughout.
-        let is_inside_single_quote = tokens.iter().any(|t| {
-            if let Some(OpeningState::Matched(close_idx)) = t.annotations.opening {
-                if t.token.kind == TokenKind::SingleQuote {
-                    let open_end = t.token.byte_range().end;
-                    let close_start = tokens[close_idx].token.byte_range().start;
-                    return open_end <= just_inserted_pos && just_inserted_pos <= close_start;
-                }
-            }
-            false
+        let is_inside_single_quote =
+            Self::is_inside_matched_quote(tokens, TokenKind::SingleQuote, just_inserted_pos);
+        let is_inside_double_quote =
+            Self::is_inside_matched_quote(tokens, TokenKind::Quote, just_inserted_pos);
+        let is_inside_cmdsubst_or_backtick =
+            Self::is_inside_cmdsubst_or_backtick(tokens, just_inserted_pos);
+        let inserted_end = just_inserted_pos + c.len_utf8();
+
+        // If a word token begins immediately after the inserted character, we inserted the quote
+        // right before or in the middle of an existing word. Auto-closing would wrap only an
+        // empty string and leave that word outside the quotes.
+        let is_before_word = tokens.iter().any(|t| {
+            t.token.kind.is_word()
+                && t.token.byte_range().start == inserted_end
+                && t.token
+                    .value
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| !ch.is_whitespace())
         });
 
-        let is_inside_double_quote = tokens.iter().any(|t| {
-            if let Some(OpeningState::Matched(close_idx)) = t.annotations.opening {
-                if t.token.kind == TokenKind::Quote {
-                    let open_end = t.token.byte_range().end;
-                    let close_start = tokens[close_idx].token.byte_range().start;
-                    return open_end <= just_inserted_pos && just_inserted_pos <= close_start;
-                }
-            }
-            false
-        });
+        // Inside a single-quoted string nothing is special – no auto-closing at all.
+        if is_inside_single_quote {
+            return None;
+        }
 
-        // If a word token starts at or contains `just_inserted_pos`, we are inserting the quote
-        // immediately before (or inside) an existing word. Auto-closing would wrap only an empty
-        // string, leaving the word outside the quotes. E.g., `"` before `bar` in `foo bar` should
-        // yield `foo "bar`, not `foo "bar"`.
-        let is_before_word = tokens
-            .iter()
-            .any(|t| t.token.kind.is_word() && t.token.byte_range().contains(&just_inserted_pos));
-
-        // Inside a matched quoted string the typed character is literal content – don't
-        // auto-close. Exception: `$` expansions are active inside double quotes, so `$(` → `)`
-        // and `${` → `}` are still auto-closed there (but not inside single quotes).
-        if is_inside_single_quote || is_inside_double_quote {
-            if is_inside_double_quote && !is_before_word && matches!(c, '(' | '{') {
-                let prev_token_kind = tokens
+        // Inside a double-quoted string, auto-closing is limited:
+        //   • $( → )  and  ${ → }  are always allowed (expansions active inside "...").
+        //   • When inside a $() or backtick nested inside the double quote, the quoting
+        //     context is reset, so all normal auto-closing rules apply (fall through).
+        //   • Everything else is suppressed.
+        if is_inside_double_quote && !is_inside_cmdsubst_or_backtick {
+            if !is_before_word && matches!(c, '(' | '{') {
+                let token_at_insertion = tokens
                     .iter()
-                    .rev()
-                    .find(|t| t.token.byte_range().end == just_inserted_pos)
+                    .find(|t| t.token.byte_range().contains(&just_inserted_pos))
                     .map(|t| &t.token.kind);
-                let closing = match (c, prev_token_kind) {
-                    ('(', Some(TokenKind::Dollar | TokenKind::CmdSubst)) => Some(')'),
-                    ('{', Some(TokenKind::Dollar)) => Some('}'),
+                let closing = match (c, token_at_insertion) {
+                    ('(', Some(TokenKind::CmdSubst)) => Some(')'),
+                    ('{', Some(TokenKind::ParamExpansion)) => Some('}'),
                     _ => None,
                 };
                 if closing.is_some() {
@@ -684,33 +871,22 @@ impl DParser {
         }
 
         // Unambiguously opening characters – always auto-close.
-        match c {
-            '{' => return Some('}'),
-            '[' => return Some(']'),
-            '(' => return Some(')'),
-            _ => {}
+        if matches!(c, '{' | '[' | '(') {
+            return Some(default_closing);
         }
 
-        // Ambiguous characters: consult the stale token annotations.
-        let (closing, opener_kind) = match c {
-            '"' => ('"', TokenKind::Quote),
-            '\'' => ('\'', TokenKind::SingleQuote),
-            '`' => ('`', TokenKind::Backtick),
-            _ => return None,
-        };
-
-        // If there is already an unmatched opener of the same kind strictly before the
-        // insertion point, the character just typed is closing it – don't auto-insert.
-        let has_unmatched_opener = tokens.iter().any(|p| {
-            p.token.byte_range().start < just_inserted_pos
-                && p.token.kind == opener_kind
-                && p.annotations.opening == Some(OpeningState::Unmatched)
+        // Ambiguous characters: if the inserted token is acting as a closer in the current parse,
+        // don't auto-insert another copy.
+        let inserted_token_is_closing = tokens.iter().any(|token| {
+            token.token.byte_range().start == just_inserted_pos
+                && token.token.value.starts_with(c)
+                && token.annotations.closing.is_some()
         });
 
-        if has_unmatched_opener {
+        if inserted_token_is_closing {
             None
         } else {
-            Some(closing)
+            Some(default_closing)
         }
     }
 
@@ -733,42 +909,6 @@ impl DParser {
             .map(|t| t.token.value.len())
             .sum();
         &buffer[..buffer.len().saturating_sub(trailing_len)]
-    }
-
-    pub fn transfer_auto_inserted_flags(
-        old_tokens: &[AnnotatedToken],
-        new_tokens: &mut [AnnotatedToken],
-    ) {
-        // Go from the left while we see identical tokens and mark any closing tokens in new_tokens as auto-inserted if the corresponding token in old_tokens was auto-inserted.
-        for (old, new) in old_tokens.iter().zip(new_tokens.iter_mut()) {
-            if old.token.kind != new.token.kind || old.token.value != new.token.value {
-                break;
-            }
-            if let Some(ClosingAnnotation {
-                opening_idx: old_opening_idx,
-                is_auto_inserted: true,
-            }) = &old.annotations.closing
-                && let Some(new_closing) = &mut new.annotations.closing
-                && *old_opening_idx == new_closing.opening_idx
-            {
-                new_closing.is_auto_inserted = true;
-            }
-        }
-
-        // Go from the right while we see identical tokens and do the same.
-        for (old, new) in old_tokens.iter().rev().zip(new_tokens.iter_mut().rev()) {
-            if old.token.kind != new.token.kind || old.token.value != new.token.value {
-                break;
-            }
-            if let Some(ClosingAnnotation {
-                is_auto_inserted: true,
-                ..
-            }) = &old.annotations.closing
-                && let Some(new_closing) = &mut new.annotations.closing
-            {
-                new_closing.is_auto_inserted = true;
-            }
-        }
     }
 }
 
@@ -1159,331 +1299,6 @@ mod tests {
         assert_eq!(tokens[3].token.value, "fi");
         assert!(tokens[3].annotations.is_inside_double_quotes);
         assert!(tokens[3].annotations.command_word.is_none());
-    }
-
-    // ── closing_char_to_insert ───────────────────────────────────────────────
-    // These tests pass a *stale* (pre-insertion) FormattedBuffer to
-    // closing_char_to_insert, mirroring how App uses formatted_buffer_cache.
-
-    #[test]
-    fn closing_char_for_opening_double_quote() {
-        // Stale buffer is "echo " (before the " was typed).
-        let stale = "echo ";
-        let mut parser = DParser::from(stale);
-        parser.walk_to_end();
-        let just_inserted_pos = stale.len();
-        assert_eq!(
-            DParser::closing_char_to_insert(&parser.tokens(), '"', just_inserted_pos),
-            Some('"')
-        );
-    }
-
-    #[test]
-    fn no_closing_char_for_closing_double_quote() {
-        // Stale buffer is `echo "hello` (before the closing " was typed).
-        let stale = r#"echo "hello"#;
-        let mut parser = DParser::from(stale);
-        parser.walk_to_end();
-        let just_inserted_pos = stale.len();
-        assert_eq!(
-            DParser::closing_char_to_insert(&parser.tokens(), '"', just_inserted_pos),
-            None
-        );
-    }
-
-    #[test]
-    fn closing_char_for_opening_single_quote() {
-        let stale = "echo ";
-        let mut parser = DParser::from(stale);
-        parser.walk_to_end();
-        let just_inserted_pos = stale.len();
-        assert_eq!(
-            DParser::closing_char_to_insert(&parser.tokens(), '\'', just_inserted_pos),
-            Some('\'')
-        );
-    }
-
-    #[test]
-    fn no_closing_char_for_closing_single_quote() {
-        let stale = "echo 'hello";
-        let mut parser = DParser::from(stale);
-        parser.walk_to_end();
-        let just_inserted_pos = stale.len();
-        assert_eq!(
-            DParser::closing_char_to_insert(&parser.tokens(), '\'', just_inserted_pos),
-            None
-        );
-    }
-
-    #[test]
-    fn closing_char_for_opening_brace() {
-        // { is never ambiguous; always produces a closing }.
-        let stale = "echo ";
-        let mut parser = DParser::from(stale);
-        parser.walk_to_end();
-        let just_inserted_pos = stale.len();
-        assert_eq!(
-            DParser::closing_char_to_insert(&parser.tokens(), '{', just_inserted_pos),
-            Some('}')
-        );
-    }
-
-    #[test]
-    fn closing_char_for_opening_backtick() {
-        let stale = "echo ";
-        let mut parser = DParser::from(stale);
-        parser.walk_to_end();
-        let just_inserted_pos = stale.len();
-        assert_eq!(
-            DParser::closing_char_to_insert(&parser.tokens(), '`', just_inserted_pos),
-            Some('`')
-        );
-    }
-
-    #[test]
-    fn no_closing_char_for_closing_backtick() {
-        // Stale buffer is `echo `ls` (before the closing backtick was typed).
-        let stale = "echo `ls";
-        let mut parser = DParser::from(stale);
-        parser.walk_to_end();
-        let just_inserted_pos = stale.len();
-        assert_eq!(
-            DParser::closing_char_to_insert(&parser.tokens(), '`', just_inserted_pos),
-            None
-        );
-    }
-
-    #[test]
-    fn no_closing_char_for_unrecognised_character() {
-        let stale = "echo ";
-        let mut parser = DParser::from(stale);
-        parser.walk_to_end();
-        let just_inserted_pos = stale.len();
-        assert_eq!(
-            DParser::closing_char_to_insert(&parser.tokens(), 'a', just_inserted_pos),
-            None
-        );
-    }
-
-    #[test]
-    fn closing_char_second_quote_pair_after_first_closed() {
-        // `echo "a" ` – the first pair is closed; the next " opens a new pair.
-        let stale = r#"echo "a" "#;
-        let mut parser = DParser::from(stale);
-        parser.walk_to_end();
-        let just_inserted_pos = stale.len();
-        assert_eq!(
-            DParser::closing_char_to_insert(&parser.tokens(), '"', just_inserted_pos),
-            Some('"')
-        );
-    }
-
-    #[test]
-    fn closing_char_dont_insert_in_comment() {
-        // `echo # comment ` – the # starts a comment, so the next " is just a literal character, not an opener.
-        let stale = "echo # comment ";
-        let mut parser = DParser::from(stale);
-        parser.walk_to_end();
-        let just_inserted_pos = stale.len();
-        assert_eq!(
-            DParser::closing_char_to_insert(&parser.tokens(), '"', just_inserted_pos),
-            None
-        );
-    }
-
-    // ── Case 1: insertion inside an already-matched quoted string ────────────
-
-    #[test]
-    fn no_closing_char_single_quote_inserted_inside_double_quoted_string() {
-        // Buffer is `"abcde"` (fully matched). Cursor between `b` and `c` (pos 3).
-        // Inserting `'` inside an existing double-quoted string should not auto-close.
-        let stale = r#""abcde""#;
-        let mut parser = DParser::from(stale);
-        parser.walk_to_end();
-        // Position 3 is inside the word `abcde` (byte range 1..6), which is inside the quotes.
-        let just_inserted_pos = 3;
-        assert_eq!(
-            DParser::closing_char_to_insert(&parser.tokens(), '\'', just_inserted_pos),
-            None
-        );
-    }
-
-    #[test]
-    fn no_closing_char_quote_inserted_at_boundary_before_closing_double_quote() {
-        // Buffer is `"abcde"`. Cursor at position 6, right before the closing `"`.
-        // Inserting `'` there should not auto-close.
-        let stale = r#""abcde""#;
-        let mut parser = DParser::from(stale);
-        parser.walk_to_end();
-        // `"` is at 0, `abcde` is at 1..6, closing `"` is at 6.
-        let just_inserted_pos = 6;
-        assert_eq!(
-            DParser::closing_char_to_insert(&parser.tokens(), '\'', just_inserted_pos),
-            None
-        );
-    }
-
-    #[test]
-    fn no_closing_char_double_quote_inserted_inside_single_quoted_string() {
-        // Buffer is `'hello world'` (fully matched single-quoted string).
-        // Cursor at position 5 (inside the content).
-        // Inserting `"` inside a single-quoted string should not auto-close.
-        let stale = "'hello world'";
-        let mut parser = DParser::from(stale);
-        parser.walk_to_end();
-        let just_inserted_pos = 5;
-        assert_eq!(
-            DParser::closing_char_to_insert(&parser.tokens(), '"', just_inserted_pos),
-            None
-        );
-    }
-
-    #[test]
-    fn no_closing_char_single_quote_inserted_inside_single_quoted_string() {
-        // Buffer is `'hello world'` (fully matched). Cursor at position 5.
-        // Inserting another `'` inside should not auto-close.
-        let stale = "'hello world'";
-        let mut parser = DParser::from(stale);
-        parser.walk_to_end();
-        let just_inserted_pos = 5;
-        assert_eq!(
-            DParser::closing_char_to_insert(&parser.tokens(), '\'', just_inserted_pos),
-            None
-        );
-    }
-
-    // ── Case 2: insertion immediately before a word token ────────────────────
-
-    #[test]
-    fn no_closing_char_double_quote_inserted_before_word() {
-        // Buffer is `foo bar`. Cursor at position 4 (start of `bar`).
-        // Inserting `"` before a word should give `foo "bar`, not `foo "bar"`.
-        let stale = "foo bar";
-        let mut parser = DParser::from(stale);
-        parser.walk_to_end();
-        let just_inserted_pos = 4; // byte offset of `b` in `bar`
-        assert_eq!(
-            DParser::closing_char_to_insert(&parser.tokens(), '"', just_inserted_pos),
-            None
-        );
-    }
-
-    #[test]
-    fn no_closing_char_single_quote_inserted_before_word() {
-        // Buffer is `foo bar`. Cursor at position 4 (start of `bar`).
-        // Inserting `'` before a word should not auto-close.
-        let stale = "foo bar";
-        let mut parser = DParser::from(stale);
-        parser.walk_to_end();
-        let just_inserted_pos = 4;
-        assert_eq!(
-            DParser::closing_char_to_insert(&parser.tokens(), '\'', just_inserted_pos),
-            None
-        );
-    }
-
-    #[test]
-    fn no_closing_char_double_quote_inserted_within_word() {
-        // Buffer is `foobar`. Cursor at position 3 (inside the word).
-        // Inserting `"` inside a word should not auto-close.
-        let stale = "foobar";
-        let mut parser = DParser::from(stale);
-        parser.walk_to_end();
-        let just_inserted_pos = 3;
-        assert_eq!(
-            DParser::closing_char_to_insert(&parser.tokens(), '"', just_inserted_pos),
-            None
-        );
-    }
-
-    #[test]
-    fn closing_char_double_quote_after_word_is_inserted() {
-        // Buffer is `foo`. Cursor at the end (position 3, after the word).
-        // Inserting `"` after a word (not before one) should still auto-close.
-        let stale = "foo ";
-        let mut parser = DParser::from(stale);
-        parser.walk_to_end();
-        let just_inserted_pos = stale.len(); // position 4, past whitespace
-        assert_eq!(
-            DParser::closing_char_to_insert(&parser.tokens(), '"', just_inserted_pos),
-            Some('"')
-        );
-    }
-
-    // ── Dollar-prefix auto-close inside double-quoted strings ────────────────
-
-    #[test]
-    fn paren_auto_closed_after_dollar_inside_double_quoted_string() {
-        // Stale buffer: `"$"` – the `"` pair is matched (auto-inserted closing).
-        // Cursor is at position 2 (after `$`, before the closing `"`).
-        // Typing `(` should still produce `)` because `$(` is a valid expansion.
-        let stale = r#""$""#;
-        let mut parser = DParser::from(stale);
-        parser.walk_to_end();
-        let just_inserted_pos = 2; // after `$`
-        assert_eq!(
-            DParser::closing_char_to_insert(&parser.tokens(), '(', just_inserted_pos),
-            Some(')')
-        );
-    }
-
-    #[test]
-    fn paren_auto_closed_after_cmdsubst_inside_double_quoted_string() {
-        // Stale buffer: `"$()"` – `$(` is a CmdSubst token, `)` auto-inserted, `"` matched.
-        // Cursor is at position 3 (after `$(`, before the auto-inserted `)`).
-        // Typing `(` should produce `)` to allow `$((1+2))`.
-        let stale = r#""$()""#;
-        let mut parser = DParser::from(stale);
-        parser.walk_to_end();
-        let just_inserted_pos = 3; // after `$(`
-        assert_eq!(
-            DParser::closing_char_to_insert(&parser.tokens(), '(', just_inserted_pos),
-            Some(')')
-        );
-    }
-
-    #[test]
-    fn brace_auto_closed_after_dollar_inside_double_quoted_string() {
-        // Stale buffer: `"$"` – matched double-quoted pair.
-        // Cursor at position 2 (after `$`).
-        // Typing `{` should produce `}` because `${var}` is a valid expansion.
-        let stale = r#""$""#;
-        let mut parser = DParser::from(stale);
-        parser.walk_to_end();
-        let just_inserted_pos = 2; // after `$`
-        assert_eq!(
-            DParser::closing_char_to_insert(&parser.tokens(), '{', just_inserted_pos),
-            Some('}')
-        );
-    }
-
-    #[test]
-    fn no_paren_auto_close_after_dollar_inside_single_quoted_string() {
-        // Stale buffer: `'$'` – single-quoted, `$` is literal; no expansion.
-        // Cursor at position 2 (after `$`).
-        // Typing `(` should NOT auto-close.
-        let stale = "'$'";
-        let mut parser = DParser::from(stale);
-        parser.walk_to_end();
-        let just_inserted_pos = 2; // after `$`
-        assert_eq!(
-            DParser::closing_char_to_insert(&parser.tokens(), '(', just_inserted_pos),
-            None
-        );
-    }
-
-    #[test]
-    fn no_brace_auto_close_after_dollar_inside_single_quoted_string() {
-        // Stale buffer: `'$'` – single-quoted.
-        // Typing `{` should NOT auto-close.
-        let stale = "'$'";
-        let mut parser = DParser::from(stale);
-        parser.walk_to_end();
-        let just_inserted_pos = 2; // after `$`
-        assert_eq!(
-            DParser::closing_char_to_insert(&parser.tokens(), '{', just_inserted_pos),
-            None
-        );
     }
 
     #[test]
