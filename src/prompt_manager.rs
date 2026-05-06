@@ -765,7 +765,8 @@ fn resolve_placeholder(w: &PromptWidgetCustom) -> Vec<TaggedSpan<'static>> {
 }
 
 /// Find the longest substring of `text` that looks like the current working
-/// directory or any contiguous sub-path of it.
+/// directory or any contiguous sub-path of it, extended leftward to absorb any
+/// truncated segment prefix (e.g. `"..."`, `"uncated"`, or `"...uncated"`).
 fn find_cwd_in_span(text: &str, cwd: &str) -> Option<Range<usize>> {
     // Early exit: a CWD path must contain '/' or start with '~'.
     // Spans with neither cannot match any CWD sub-path.
@@ -824,7 +825,147 @@ fn find_cwd_in_span(text: &str, cwd: &str) -> Option<Range<usize>> {
         try_candidate(&cwd_suffix_with_tilde_and_slash, &mut best);
     }
 
-    best
+    let cwd_range = best?;
+
+    // Extend the range leftward to absorb any truncated path prefix.
+    let extended_start = extend_cwd_range_start(text, &cwd_range, cwd);
+    Some(extended_start..cwd_range.end)
+}
+
+/// Returns `true` if `s` looks like an ellipsis indicator used in truncated
+/// paths: a sequence of one or more ASCII dots (`"."`, `".."`, `"..."`, etc.)
+/// or the Unicode ellipsis character `"…"` (U+2026).
+fn is_ellipsis_like(s: &str) -> bool {
+    !s.is_empty() && (s.chars().all(|c| c == '.') || s == "…")
+}
+
+/// Return the CWD segment that immediately precedes the first directory-name
+/// segment visible in `cwd_match_text` (the substring of the prompt that was
+/// recognised as a CWD path), given the full `cwd` string.
+///
+/// For example, if `cwd` is `/home/user/truncated/foo/bar` and
+/// `cwd_match_text` is `"/foo/bar"`, the first visible segment is `"foo"` and
+/// the preceding segment is `"truncated"`.
+///
+/// Returns `None` when there is no preceding segment (i.e. the match already
+/// starts at the first segment of the CWD) or when the match segments cannot
+/// be located inside the CWD.
+fn preceding_cwd_segment<'a>(cwd_match_text: &str, cwd: &'a str) -> Option<&'a str> {
+    // Strip leading/trailing slashes and a leading tilde.
+    let inner = cwd_match_text.trim_start_matches('/');
+    let inner = if inner.starts_with('~') {
+        inner[1..].trim_start_matches('/')
+    } else {
+        inner
+    };
+    let inner = inner.trim_end_matches('/');
+
+    let match_segs: Vec<&str> = inner.split('/').filter(|s| !s.is_empty()).collect();
+    if match_segs.is_empty() {
+        return None;
+    }
+
+    let cwd_segs: Vec<&str> = cwd
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let n_match = match_segs.len();
+    let n_cwd = cwd_segs.len();
+    if n_cwd < n_match {
+        return None;
+    }
+
+    // Find the rightmost contiguous run in `cwd_segs` that equals `match_segs`.
+    for i in (0..=(n_cwd - n_match)).rev() {
+        if cwd_segs[i..i + n_match] == match_segs[..] {
+            if i == 0 {
+                return None;
+            }
+            return Some(cwd_segs[i - 1]);
+        }
+    }
+    None
+}
+
+/// Attempt to extend `cwd_range.start` leftward to include a truncated path
+/// segment that was stripped when the prompt shortened the CWD.
+///
+/// The algorithm works in two passes, both reading right-to-left through the
+/// text that immediately precedes the detected CWD range:
+///
+/// 1. **Consume CWD suffix chars** – walk backward through the prefix one
+///    character at a time, matching against the *end* of the CWD segment that
+///    immediately precedes the first visible segment.  For example, if the
+///    preceding segment is `"truncated"` and the prefix ends with `"uncated"`,
+///    those seven characters are consumed.
+///
+/// 2. **Consume ellipsis** – once no more CWD-segment characters can be
+///    consumed, check whether the text immediately before the consumed suffix
+///    ends with an ellipsis-like string (`"..."`, `"…"`, etc.).  If so, absorb
+///    that too.
+///
+/// This handles all of the following prompt patterns:
+/// - `.../foo/bar`       → `...` is absorbed (ellipsis, no partial segment)
+/// - `uncated/foo/bar`   → `uncated` is absorbed (partial segment, no ellipsis)
+/// - `...uncated/foo/bar`→ both `...` and `uncated` are absorbed
+///
+/// Returns the (possibly unchanged) start index for the CWD range.
+fn extend_cwd_range_start(text: &str, cwd_range: &Range<usize>, cwd: &str) -> usize {
+    if cwd_range.start == 0 {
+        return 0;
+    }
+
+    let prefix = &text[..cwd_range.start];
+    let cwd_match_text = &text[cwd_range.clone()];
+
+    // Step 1: walk backward through the prefix consuming characters that match
+    // the end of the preceding CWD segment one by one.
+    let preceding = preceding_cwd_segment(cwd_match_text, cwd);
+    let seg_chars: Vec<char> = preceding.map(|s| s.chars().collect()).unwrap_or_default();
+
+    let prefix_chars: Vec<(usize, char)> = prefix.char_indices().collect();
+    let mut prefix_idx = prefix_chars.len(); // remaining unconsumed prefix chars (from left)
+    let mut seg_idx = seg_chars.len(); // remaining unconsumed segment chars (from right)
+
+    while prefix_idx > 0 && seg_idx > 0 {
+        let (_, ch) = prefix_chars[prefix_idx - 1];
+        if ch == seg_chars[seg_idx - 1] {
+            prefix_idx -= 1;
+            seg_idx -= 1;
+        } else {
+            break;
+        }
+    }
+
+    // Byte offset in `prefix` where the consumed CWD-suffix characters begin.
+    // When nothing was consumed this equals `cwd_range.start` (= prefix.len()).
+    let cwd_suffix_byte_start = prefix_chars
+        .get(prefix_idx)
+        .map(|&(i, _)| i)
+        .unwrap_or(cwd_range.start);
+
+    // Step 2: look for an ellipsis-like string immediately before the consumed
+    // CWD-suffix characters (or before the CWD range if nothing was consumed).
+    let before_suffix = &prefix[..cwd_suffix_byte_start];
+
+    // Find the last contiguous non-separator run at the end of `before_suffix`.
+    // Separators are whitespace and '/'; they cannot be part of the ellipsis.
+    let ellipsis_candidate_start = before_suffix
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_whitespace() || *c == '/')
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    let ellipsis_candidate = &before_suffix[ellipsis_candidate_start..];
+
+    if is_ellipsis_like(ellipsis_candidate) {
+        return ellipsis_candidate_start;
+    }
+
+    // Return the start of the consumed CWD-suffix chars, even without an ellipsis.
+    cwd_suffix_byte_start
 }
 
 /// Split a static [`Span`] at the first (longest) detected CWD substring,
@@ -1808,6 +1949,310 @@ mod tests {
         let cwd_range = result.expect("should find a match");
         assert_eq!(&text[cwd_range], "/home/qwe/try/ooh/lkj/");
     }
+    // --- is_ellipsis_like -----------------------------------------------------
+
+    #[test]
+    fn test_is_ellipsis_like_dots() {
+        assert!(is_ellipsis_like("."));
+        assert!(is_ellipsis_like(".."));
+        assert!(is_ellipsis_like("..."));
+    }
+
+    #[test]
+    fn test_is_ellipsis_like_unicode() {
+        assert!(is_ellipsis_like("…"));
+    }
+
+    #[test]
+    fn test_is_ellipsis_like_false_for_words() {
+        assert!(!is_ellipsis_like("foo"));
+        assert!(!is_ellipsis_like("truncated"));
+        assert!(!is_ellipsis_like(""));
+    }
+
+    // --- preceding_cwd_segment -----------------------------------------------
+
+    #[test]
+    fn test_preceding_cwd_segment_slash_prefix() {
+        // Match "/foo/bar" against CWD "/home/user/truncated/foo/bar"
+        // → preceding segment is "truncated"
+        assert_eq!(
+            preceding_cwd_segment("/foo/bar", "/home/user/truncated/foo/bar"),
+            Some("truncated")
+        );
+    }
+
+    #[test]
+    fn test_preceding_cwd_segment_no_prefix() {
+        // Match starts at the first segment → no preceding segment
+        assert_eq!(
+            preceding_cwd_segment("/home/user/foo", "/home/user/foo"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_preceding_cwd_segment_tilde_prefix() {
+        // Tilde-prefixed matches: "~/foo/bar" with CWD "/home/user/foo/bar"
+        // After stripping tilde the first segment is "foo"; preceding is "user"
+        assert_eq!(
+            preceding_cwd_segment("~/foo/bar", "/home/user/foo/bar"),
+            Some("user")
+        );
+    }
+
+    #[test]
+    fn test_preceding_cwd_segment_single_seg() {
+        // Only one segment in match and it is the first in CWD → None
+        assert_eq!(preceding_cwd_segment("/home", "/home"), None);
+    }
+
+    // --- find_cwd_in_span: truncated-prefix extension ------------------------
+
+    #[test]
+    fn test_find_cwd_ellipsis_dots_prefix() {
+        // ".../foo/bar" — "..." is absorbed into the returned range.
+        let text = ".../foo/bar";
+        let cwd = "/a/b/c/foo/bar";
+        let range = find_cwd_in_span(text, cwd).expect("should find range");
+        assert_eq!(&text[range], ".../foo/bar");
+    }
+
+    #[test]
+    fn test_find_cwd_unicode_ellipsis_prefix() {
+        // "…/foo/bar" — Unicode ellipsis is absorbed.
+        let text = "…/foo/bar";
+        let cwd = "/a/b/c/foo/bar";
+        let range = find_cwd_in_span(text, cwd).expect("should find range");
+        assert_eq!(&text[range], "…/foo/bar");
+    }
+
+    #[test]
+    fn test_find_cwd_truncated_segment_prefix() {
+        // "uncated/foo/bar" — "uncated" is a suffix of "truncated" and is absorbed.
+        let text = "uncated/foo/bar";
+        let cwd = "/home/user/truncated/foo/bar";
+        let range = find_cwd_in_span(text, cwd).expect("should find range");
+        assert_eq!(&text[range], "uncated/foo/bar");
+    }
+
+    #[test]
+    fn test_find_cwd_prompt_then_ellipsis_prefix() {
+        // "prefix .../foo/bar" — only "..." is absorbed; "prefix " stays outside.
+        let text = "prefix .../foo/bar";
+        let cwd = "/a/b/c/foo/bar";
+        let range = find_cwd_in_span(text, cwd).expect("should find range");
+        assert_eq!(&text[range], ".../foo/bar");
+    }
+
+    #[test]
+    fn test_find_cwd_no_extension_needed() {
+        // "PROMPT ~/foo/bar $ " — "PROMPT " is not ellipsis-like or a CWD suffix.
+        let text = "PROMPT ~/foo/bar $ ";
+        let cwd = "/home/user/foo/bar";
+        let range = find_cwd_in_span(text, cwd).expect("should find range");
+        assert_eq!(&text[range], "~/foo/bar");
+    }
+
+    #[test]
+    fn test_find_cwd_ellipsis_then_truncated_segment() {
+        // "...uncated/foo/bar" — both "..." and "uncated" are absorbed.
+        let text = "...uncated/foo/bar";
+        let cwd = "/home/user/truncated/foo/bar";
+        let range = find_cwd_in_span(text, cwd).expect("should find range");
+        assert_eq!(&text[range], "...uncated/foo/bar");
+    }
+
+    #[test]
+    fn test_find_cwd_prompt_then_ellipsis_then_truncated_segment() {
+        // "user@host ...uncated/foo/bar" — "user@host " stays outside; "...uncated" absorbed.
+        let text = "user@host ...uncated/foo/bar";
+        let cwd = "/home/user/truncated/foo/bar";
+        let range = find_cwd_in_span(text, cwd).expect("should find range");
+        assert_eq!(&text[range], "...uncated/foo/bar");
+    }
+
+    // --- split_static_span_by_cwd with truncated prefix ----------------------
+
+    #[test]
+    fn test_split_span_ellipsis_then_truncated_segment_becomes_cwd() {
+        // "...uncated/foo/bar" — the entire "...uncated" prefix is absorbed.
+        let span = Span::raw("...uncated/foo/bar");
+        let cwd = "/home/user/truncated/foo/bar";
+        let segs = split_static_span_by_cwd(span, cwd);
+        assert_eq!(segs.len(), 1);
+        match &segs[0] {
+            PromptSegment::Cwd(spans) => {
+                let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+                assert_eq!(text, "...uncated/foo/bar");
+                // split_cwd_text_into_spans produces "...uncated" as one span (no '/' inside it)
+                assert_eq!(spans[0].content.as_ref(), "...uncated");
+            }
+            _ => panic!("expected Cwd segment"),
+        }
+    }
+
+    #[test]
+    fn test_split_span_prefix_ellipsis_truncated_segment_in_larger_prompt() {
+        // "host ...uncated/foo/bar $ " — static parts are preserved around the CWD.
+        let span = Span::raw("host ...uncated/foo/bar $ ");
+        let cwd = "/home/user/truncated/foo/bar";
+        let segs = split_static_span_by_cwd(span, cwd);
+        assert_eq!(segs.len(), 3);
+        match &segs[0] {
+            PromptSegment::Static(s) => assert_eq!(s.content.as_ref(), "host "),
+            _ => panic!("expected Static"),
+        }
+        match &segs[1] {
+            PromptSegment::Cwd(spans) => {
+                let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+                assert_eq!(text, "...uncated/foo/bar");
+                assert_eq!(spans[0].content.as_ref(), "...uncated");
+            }
+            _ => panic!("expected Cwd"),
+        }
+        match &segs[2] {
+            PromptSegment::Static(s) => assert_eq!(s.content.as_ref(), " $ "),
+            _ => panic!("expected Static"),
+        }
+    }
+
+    #[test]
+    fn test_split_span_ellipsis_prefix_becomes_cwd() {
+        // ".../foo/bar" — the "..." prefix should end up inside the Cwd segment.
+        let span = Span::raw(".../foo/bar");
+        let cwd = "/a/b/c/foo/bar";
+        let segs = split_static_span_by_cwd(span, cwd);
+        // Expect exactly one Cwd segment (no Static prefix).
+        assert_eq!(segs.len(), 1);
+        match &segs[0] {
+            PromptSegment::Cwd(spans) => {
+                let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+                assert_eq!(text, ".../foo/bar");
+                // First span should be "..."
+                assert_eq!(spans[0].content.as_ref(), "...");
+            }
+            _ => panic!("expected Cwd segment"),
+        }
+    }
+
+    #[test]
+    fn test_split_span_unicode_ellipsis_prefix_becomes_cwd() {
+        let span = Span::raw("…/foo/bar");
+        let cwd = "/a/b/c/foo/bar";
+        let segs = split_static_span_by_cwd(span, cwd);
+        assert_eq!(segs.len(), 1);
+        match &segs[0] {
+            PromptSegment::Cwd(spans) => {
+                assert_eq!(spans[0].content.as_ref(), "…");
+            }
+            _ => panic!("expected Cwd segment"),
+        }
+    }
+
+    #[test]
+    fn test_split_span_truncated_segment_prefix_becomes_cwd() {
+        // "uncated/foo/bar" — "uncated" is suffix of CWD segment "truncated".
+        let span = Span::raw("uncated/foo/bar");
+        let cwd = "/home/user/truncated/foo/bar";
+        let segs = split_static_span_by_cwd(span, cwd);
+        assert_eq!(segs.len(), 1);
+        match &segs[0] {
+            PromptSegment::Cwd(spans) => {
+                let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+                assert_eq!(text, "uncated/foo/bar");
+                assert_eq!(spans[0].content.as_ref(), "uncated");
+            }
+            _ => panic!("expected Cwd segment"),
+        }
+    }
+
+    #[test]
+    fn test_split_span_ellipsis_in_larger_prompt() {
+        // "user@host .../foo/bar $ " — the static parts around the path are preserved.
+        let span = Span::raw("user@host .../foo/bar $ ");
+        let cwd = "/a/b/c/foo/bar";
+        let segs = split_static_span_by_cwd(span, cwd);
+        // Expected: Static("user@host "), Cwd(".../foo/bar"), Static(" $ ")
+        assert_eq!(segs.len(), 3);
+        match &segs[0] {
+            PromptSegment::Static(s) => assert_eq!(s.content.as_ref(), "user@host "),
+            _ => panic!("expected Static"),
+        }
+        match &segs[1] {
+            PromptSegment::Cwd(spans) => {
+                let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+                assert_eq!(text, ".../foo/bar");
+                assert_eq!(spans[0].content.as_ref(), "...");
+            }
+            _ => panic!("expected Cwd"),
+        }
+        match &segs[2] {
+            PromptSegment::Static(s) => assert_eq!(s.content.as_ref(), " $ "),
+            _ => panic!("expected Static"),
+        }
+    }
+
+    // --- format_prompt_line tagging for truncated-prefix CWD -----------------
+
+    #[test]
+    fn test_format_prompt_line_ellipsis_prefix_is_selectable() {
+        // ".../foo/bar" → ["...", "/", "foo", "/", "bar"]
+        // Selectable spans: "..." (i=0, first), "foo", "bar" → 3 total
+        // Indices: "..." → 2, "foo" → 1, "bar" → 0
+        let spans = split_cwd_text_into_spans(".../foo/bar", ratatui::style::Style::default());
+        let segments = vec![PromptSegment::Cwd(spans)];
+        let line = format_prompt_line(&segments, &fixed_time(0), false);
+        assert_eq!(line.spans.len(), 5);
+        // "..." → Ps1PromptCwd(2)
+        assert_eq!(
+            line.spans[0].tag,
+            crate::content_builder::SpanTag::Constant(Tag::Ps1PromptCwd(2))
+        );
+        // "/" separator → Ps1Prompt (not selectable)
+        assert_eq!(
+            line.spans[1].tag,
+            crate::content_builder::SpanTag::Constant(Tag::Ps1Prompt)
+        );
+        // "foo" → Ps1PromptCwd(1)
+        assert_eq!(
+            line.spans[2].tag,
+            crate::content_builder::SpanTag::Constant(Tag::Ps1PromptCwd(1))
+        );
+        // "/" separator → Ps1Prompt
+        assert_eq!(
+            line.spans[3].tag,
+            crate::content_builder::SpanTag::Constant(Tag::Ps1Prompt)
+        );
+        // "bar" → Ps1PromptCwd(0)
+        assert_eq!(
+            line.spans[4].tag,
+            crate::content_builder::SpanTag::Constant(Tag::Ps1PromptCwd(0))
+        );
+    }
+
+    #[test]
+    fn test_format_prompt_line_truncated_segment_is_selectable() {
+        // "uncated/foo/bar" → ["uncated", "/", "foo", "/", "bar"]
+        // "uncated" is at i=0 → selectable
+        let spans = split_cwd_text_into_spans("uncated/foo/bar", ratatui::style::Style::default());
+        let segments = vec![PromptSegment::Cwd(spans)];
+        let line = format_prompt_line(&segments, &fixed_time(0), false);
+        assert_eq!(line.spans.len(), 5);
+        assert_eq!(
+            line.spans[0].tag,
+            crate::content_builder::SpanTag::Constant(Tag::Ps1PromptCwd(2))
+        );
+        assert_eq!(
+            line.spans[2].tag,
+            crate::content_builder::SpanTag::Constant(Tag::Ps1PromptCwd(1))
+        );
+        assert_eq!(
+            line.spans[4].tag,
+            crate::content_builder::SpanTag::Constant(Tag::Ps1PromptCwd(0))
+        );
+    }
+
     // --- expand_span_to_segments with CWD detection --------------------------
 
     #[test]
