@@ -1,17 +1,19 @@
+use std::collections::HashSet;
+use std::vec;
+
 use crate::active_suggestions::{
     ActiveSuggestions, ActiveSuggestionsBuilder, ProcessedSuggestion, SuggestionDescription,
     UnprocessedSuggestion,
 };
 use crate::app::{App, ContentMode, TabCompletionHandle};
 use crate::bash_funcs::{self, QuoteType};
-use crate::content_utils::{ansi_string_to_spans, easing_animation_frames};
+use crate::content_utils::{self, ansi_string_to_spans, easing_animation_frames};
 use crate::cursor::{CursorEasing, cursor_effect_animation_frames};
 use crate::globbing::PathPatternExpansion;
 use crate::iter_first_last::FirstLast;
 use crate::text_buffer::SubString;
 use crate::users;
 use crate::{complete_flyline_args, tab_completion_context};
-use skim::fuzzy_matcher::FuzzyMatcher;
 use skim::fuzzy_matcher::arinae::ArinaeMatcher;
 
 // bash programmable completions:
@@ -120,14 +122,29 @@ pub(crate) fn gen_completions_internal(
         log::debug!("Processing completion type: {:?}", comp_type);
         match comp_type {
             tab_completion_context::CompType::FirstWord => {
-                log::debug!("First word completion for: {:?}", word_under_cursor);
+                log::debug!("CompType::FirstWord for: {}", word_under_cursor.as_ref());
                 let completions = tab_complete_first_word(word_under_cursor.as_ref());
-                if completions.is_empty() {
-                    log::debug!(
-                        "No first word completions found for prefix: {}",
-                        word_under_cursor.as_ref()
-                    );
-                } else {
+                log::debug!(
+                    "CompType::FirstWord found {} completions for prefix: {}",
+                    completions.len(),
+                    word_under_cursor.as_ref()
+                );
+                if !completions.is_empty() {
+                    return Some(completions);
+                }
+            }
+            tab_completion_context::CompType::FuzzyFirstWord => {
+                log::debug!(
+                    "CompType::FuzzyFirstWord for: {}",
+                    word_under_cursor.as_ref()
+                );
+                let completions = tab_complete_fuzzy_first_word(word_under_cursor.as_ref());
+                log::debug!(
+                    "CompType::FuzzyFirstWord found {} completions for prefix: {}",
+                    completions.len(),
+                    word_under_cursor.as_ref()
+                );
+                if !completions.is_empty() {
                     return Some(completions);
                 }
             }
@@ -283,15 +300,15 @@ pub(crate) fn gen_completions_internal(
             }
 
             tab_completion_context::CompType::EnvVariable => {
-                log::debug!("Environment variable completion {:?}", word_under_cursor);
+                log::debug!("CompType::EnvVariable for {}", word_under_cursor.as_ref());
                 let matching_vars =
                     bash_funcs::get_all_variables_with_prefix(word_under_cursor.as_ref());
-                if matching_vars.is_empty() {
-                    log::debug!(
-                        "No environment variable completions found for prefix: {}",
-                        word_under_cursor.as_ref()
-                    );
-                } else {
+                log::debug!(
+                    "CompType::EnvVariable found {} completions for prefix: {}",
+                    matching_vars.len(),
+                    word_under_cursor.as_ref()
+                );
+                if !matching_vars.is_empty() {
                     let mut builder = ActiveSuggestionsBuilder::new();
                     builder.extend_processed(ProcessedSuggestion::from_string_vec(
                         matching_vars,
@@ -302,48 +319,41 @@ pub(crate) fn gen_completions_internal(
                 }
             }
             tab_completion_context::CompType::TildeExpansion => {
-                log::debug!("Tilde expansion completion: {:?}", word_under_cursor);
+                log::debug!(
+                    "CompType::TildeExpansion for {}",
+                    word_under_cursor.as_ref()
+                );
                 let completions = tab_complete_tilde_expansion(word_under_cursor.as_ref());
-                if completions.is_empty() {
-                    log::debug!(
-                        "No tilde expansion completions found for pattern: {}",
-                        word_under_cursor.as_ref()
-                    );
-                } else {
+                log::debug!(
+                    "CompType::TildeExpansion found {} completions for pattern: {}",
+                    completions.len(),
+                    word_under_cursor.as_ref()
+                );
+                if !completions.is_empty() {
                     let mut builder = ActiveSuggestionsBuilder::new();
                     builder.extend_processed(completions);
                     return Some(builder);
                 }
             }
             tab_completion_context::CompType::GlobExpansion => {
-                log::debug!("Glob expansion for: {:?}", word_under_cursor);
+                log::debug!("CompType::GlobExpansion for {}", word_under_cursor.as_ref());
                 let completions =
                     tab_complete_glob_expansion(word_under_cursor.as_ref(), comp_res_flags);
 
+                log::debug!(
+                    "CompType::GlobExpansion found {} completions for pattern: {}",
+                    completions.len(),
+                    word_under_cursor.as_ref()
+                );
                 match completions.as_slice() {
-                    [] => {
-                        log::debug!(
-                            "No glob expansion completions found for pattern: {}",
-                            word_under_cursor.as_ref()
-                        );
-                    }
+                    [] => {}
                     [single_completion] => {
                         let processed = single_completion.clone().into_processed();
-                        log::debug!(
-                            "Only one glob expansion completion found for pattern '{}': '{:?}'",
-                            word_under_cursor.as_ref(),
-                            processed
-                        );
                         let mut builder = ActiveSuggestionsBuilder::new();
                         builder.push_processed(processed);
                         return Some(builder);
                     }
                     _ => {
-                        log::debug!(
-                            "Multiple glob expansion completions found for pattern '{}': {:#?}",
-                            word_under_cursor.as_ref(),
-                            completions.iter().take(20)
-                        );
                         // Unlike other completions, if there are multiple glob completions,
                         // we join them with spaces and insert them all at once.
                         // Process each item eagerly here since we need the final text.
@@ -386,34 +396,40 @@ pub(crate) fn gen_completions_internal(
                 }
             }
             tab_completion_context::CompType::FilenameExpansion => {
-                log::debug!("Filename expansion for: {:?}", word_under_cursor);
+                log::debug!(
+                    "CompType::FilenameExpansion for: {}",
+                    word_under_cursor.as_ref()
+                );
                 let completions = tab_complete_glob_expansion(
                     &(word_under_cursor.as_ref().to_string() + "*"),
                     comp_res_flags,
                 );
 
-                if completions.is_empty() {
-                    log::debug!(
-                        "No filename expansion completions found for pattern: {}",
-                        word_under_cursor.as_ref()
-                    );
-                } else {
+                log::debug!(
+                    "CompType::FilenameExpansion found {} completions for pattern: {}",
+                    completions.len(),
+                    word_under_cursor.as_ref()
+                );
+                if !completions.is_empty() {
                     let mut builder = ActiveSuggestionsBuilder::new();
                     builder.extend_unprocessed(completions);
                     return Some(builder);
                 }
             }
             tab_completion_context::CompType::FuzzyFilenameExpansion => {
-                log::debug!("Fuzzy filename expansion for: {:?}", word_under_cursor);
+                log::debug!(
+                    "CompType::FuzzyFilenameExpansion for: {}",
+                    word_under_cursor.as_ref()
+                );
                 let completions =
                     tab_complete_fuzzy_filename(word_under_cursor.as_ref(), comp_res_flags);
 
-                if completions.is_empty() {
-                    log::debug!(
-                        "No fuzzy filename completions found for: {}",
-                        word_under_cursor.as_ref()
-                    );
-                } else {
+                log::debug!(
+                    "CompType::FuzzyFilenameExpansion found {} completions for pattern: {}",
+                    completions.len(),
+                    word_under_cursor.as_ref()
+                );
+                if !completions.is_empty() {
                     let mut builder =
                         ActiveSuggestionsBuilder::new().with_auto_accept_if_solo(false);
                     builder.extend_unprocessed(completions);
@@ -423,9 +439,34 @@ pub(crate) fn gen_completions_internal(
         }
     }
 
-    // gen_secondary_completions(completion_context, bash_funcs::CompletionFlags::default())
     log::debug!("No completion types produced result");
     None
+}
+
+fn filter_out_non_executables(paths: Vec<UnprocessedSuggestion>) -> Vec<UnprocessedSuggestion> {
+    paths
+        .into_iter()
+        .filter(|s| {
+            let Some(path) = s.full_path.as_ref() else {
+                return true;
+            };
+            if let Ok(sym_meta) = path.symlink_metadata() {
+                if sym_meta.file_type().is_symlink() {
+                    return true;
+                }
+            }
+            if let Ok(meta) = path.metadata() {
+                if meta.is_dir() {
+                    return true;
+                }
+                if meta.is_file() {
+                    use std::os::unix::fs::PermissionsExt;
+                    return meta.permissions().mode() & 0o111 != 0;
+                }
+            }
+            true
+        })
+        .collect()
 }
 
 fn tab_complete_first_word(command: &str) -> ActiveSuggestionsBuilder {
@@ -437,26 +478,63 @@ fn tab_complete_first_word(command: &str) -> ActiveSuggestionsBuilder {
 
     if command.starts_with('.') || command.contains('/') || command.starts_with('~') {
         // Path to executable
-        builder.extend_unprocessed(tab_complete_glob_expansion(
+        let files = tab_complete_glob_expansion(
             &(command.to_string() + "*"),
             bash_funcs::CompletionFlags::default(),
-        ));
+        );
+        let executable_files = filter_out_non_executables(files);
+        builder.extend_unprocessed(executable_files);
         return builder;
     }
 
-    let mut res = bash_funcs::get_first_word_completions(command);
+    let mut res = vec![];
+    let mut seen: HashSet<String> = HashSet::new();
+    for poss_completion in bash_funcs::get_possible_command_words() {
+        if poss_completion.starts_with(command) && seen.insert(poss_completion.clone()) {
+            res.push(poss_completion);
+        }
+    }
 
     if res.is_empty() {
-        // No prefix matches found, fall back to fuzzy search
-        log::debug!("No prefix matches for '{}', trying fuzzy search", command);
-        res = bash_funcs::get_fuzzy_first_word_completions(command);
-        builder.extend_processed(ProcessedSuggestion::from_string_vec(res, "", " "));
         return builder;
     }
 
-    // TODO: could prioritize based on frequency of use
     res.sort_by(|a, b| a.len().cmp(&b.len()).then(a.cmp(b)));
     res.dedup();
+    builder.extend_processed(ProcessedSuggestion::from_string_vec(res, "", " "));
+    builder
+}
+
+fn tab_complete_fuzzy_first_word(command: &str) -> ActiveSuggestionsBuilder {
+    log::debug!("Generating fuzzy first word completions for: '{}'", command);
+    let mut builder = ActiveSuggestionsBuilder::new();
+    if command.is_empty() {
+        return builder;
+    }
+
+    if command.starts_with('.') || command.contains('/') || command.starts_with('~') {
+        let fuzzy_files =
+            tab_complete_fuzzy_filename(command, bash_funcs::CompletionFlags::default());
+        let executable_files = filter_out_non_executables(fuzzy_files);
+        builder.extend_unprocessed(executable_files);
+        return builder;
+    }
+
+    let matcher = ArinaeMatcher::new(skim::CaseMatching::Smart, true);
+    let mut scored = vec![];
+
+    let mut seen: HashSet<String> = HashSet::new();
+    for poss_completion in bash_funcs::get_possible_command_words() {
+        if seen.insert(poss_completion.clone())
+            && let Some(score) =
+                content_utils::fuzzy_match_with_threshold(&matcher, &poss_completion, command)
+        {
+            scored.push((score, poss_completion));
+        }
+    }
+
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    let res = scored.into_iter().map(|(_, s)| s).collect();
     builder.extend_processed(ProcessedSuggestion::from_string_vec(res, "", " "));
     builder
 }
@@ -470,13 +548,12 @@ fn tab_complete_with_expanded_pattern(
     comp_resultflags: bash_funcs::CompletionFlags,
     should_skip_hidden: bool,
 ) -> Vec<UnprocessedSuggestion> {
-    
     let mut results = Vec::new();
-    
-    const MAX_GLOB_RESULTS: usize = 5_000;
-    
+
+    const MAX_GLOB_RESULTS: usize = 10_000;
+
     let glob_patterns = expanded.glob_pattern();
-    
+
     log::debug!("Performing glob expansion for expanded: {:#?}", expanded);
     log::debug!("Using glob_patterns {:?}", glob_patterns);
 
@@ -584,15 +661,14 @@ fn tab_complete_fuzzy_filename(
         return vec![];
     }
 
-
     // Set up flags for glob expansion
     comp_res_flags.filename_quoting_desired = false;
     comp_res_flags.filename_completion_desired = true;
     comp_res_flags.quote_type = bash_funcs::find_quote_type(&dir_glob_pattern);
-    
+
     let expanded = PathPatternExpansion::new(&dir_glob_pattern);
     let all_files = tab_complete_with_expanded_pattern(&expanded, comp_res_flags, false);
-    
+
     let matcher = ArinaeMatcher::new(skim::CaseMatching::Smart, true);
 
     // glob expansion handles dequoting the pattern, so we only need to dequote
@@ -605,8 +681,7 @@ fn tab_complete_fuzzy_filename(
             // directory prefix doesn't inflate the score.
             let match_text = sug.match_text();
             let filename = match_text.rsplit('/').next().unwrap_or(match_text);
-            matcher
-                .fuzzy_match(filename, &dequoted_fragment)
+            content_utils::fuzzy_match_with_threshold(&matcher, filename, &dequoted_fragment)
                 .map(|score| (score, sug))
         })
         .collect();
