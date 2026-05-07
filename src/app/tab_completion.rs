@@ -45,62 +45,6 @@ use skim::fuzzy_matcher::arinae::ArinaeMatcher;
 //   if (iscompgen && iscompleting == 0 && rl_completion_found_quote == 0
 //   && rl_filename_dequoting_function) { ... }
 
-struct AliasExpandedCompletion {
-    command_word: String,
-    full_command: String,
-    cursor_byte_pos: usize,
-    word_under_cursor_end: usize,
-}
-
-/// Expands `command_word` through bash alias resolution and recomputes the
-/// context offsets to account for any length change introduced by the alias.
-///
-/// Taking `command_word` by value (ownership) ensures that the pre-expansion
-/// name is no longer accessible at the call site after this function is called,
-/// preventing accidental re-use of stale data.
-///
-/// `word_under_cursor` must be a sub-slice of `context`.
-fn expand_alias_for_completion(
-    command_word: String,
-    word_under_cursor: &SubString,
-    context: &str,
-    context_until_cursor: &str,
-) -> AliasExpandedCompletion {
-    let command_word_len = command_word.len();
-
-    let poss_alias = bash_funcs::find_alias(&command_word);
-    log::debug!(
-        "Checking for alias for command word '{}': {:?}",
-        command_word,
-        poss_alias
-    );
-
-    // `find_alias` may return `Some("")` for known-but-empty aliases; treat
-    // those as "no alias" and fall back to the original command word.
-    // `alias` is guaranteed non-empty after this point.
-    let alias = poss_alias.filter(|a| !a.is_empty()).unwrap_or(command_word);
-
-    let len_delta = alias.len() as isize - command_word_len as isize;
-    let word_under_cursor_end = word_under_cursor.end().saturating_add_signed(len_delta);
-
-    // cursor position relative to the start of the completion context
-    let cursor_byte_pos = context_until_cursor.len().saturating_add_signed(len_delta);
-
-    let full_command = alias.clone() + &context[command_word_len..];
-    let command_word = alias
-        .split_whitespace()
-        .next()
-        .unwrap_or(&alias)
-        .to_string();
-
-    AliasExpandedCompletion {
-        command_word,
-        full_command,
-        cursor_byte_pos,
-        word_under_cursor_end,
-    }
-}
-
 pub(crate) fn gen_completions_internal(
     completion_context: &tab_completion_context::CompletionContext,
 ) -> Option<ActiveSuggestionsBuilder> {
@@ -150,28 +94,42 @@ pub(crate) fn gen_completions_internal(
                 // https://www.reddit.com/r/bash/comments/eqwitd/programmable_completion_on_expanded_aliases_not/
                 // Since aliases are the highest priority in command word resolution,
                 // If it is an alias, lets expand it here for better completion results.
-                let AliasExpandedCompletion {
-                    command_word,
-                    full_command,
-                    cursor_byte_pos,
-                    word_under_cursor_end,
-                } = expand_alias_for_completion(
-                    initial_command_word.to_string(),
-                    word_under_cursor,
-                    completion_context.context.as_ref(),
-                    completion_context.context_until_cursor.as_ref(),
+                let poss_alias = bash_funcs::find_alias(initial_command_word);
+                log::debug!(
+                    "Checking for alias for command word '{}': {:?}",
+                    initial_command_word,
+                    poss_alias
                 );
+                let alias_def = poss_alias
+                    .as_deref()
+                    .filter(|alias| !alias.is_empty())
+                    .unwrap_or(initial_command_word);
+                let alias_expanded_completion_context =
+                    completion_context.with_expanded_alias(alias_def);
+                let alias_expanded_command_word = alias_def
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or(alias_def)
+                    .to_string();
+                let alias_expanded_full_command =
+                    alias_expanded_completion_context.context.as_ref();
+                let alias_expanded_cursor_byte_pos =
+                    alias_expanded_completion_context.cursor_byte_pos_context_relative();
+                let alias_expanded_word_under_cursor =
+                    alias_expanded_completion_context.word_under_cursor.as_ref();
+                let alias_expanded_word_under_cursor_end =
+                    alias_expanded_completion_context.word_under_cursor_end_context_relative();
 
-                if command_word == "flyline" {
+                if alias_expanded_command_word == "flyline" {
                     // Flyline's own subcommand/flag completions are produced by
                     // clap_complete and are already escaped/finalized. Skip the
                     // bash post-processing pipeline entirely and build
                     // ProcssedSuggestions directly so descriptions (the help text
                     // attached to each candidate) are preserved as-is.
                     match complete_flyline_args(
-                        &full_command,
-                        word_under_cursor.as_ref(),
-                        cursor_byte_pos,
+                        alias_expanded_full_command,
+                        alias_expanded_word_under_cursor,
+                        alias_expanded_cursor_byte_pos,
                     ) {
                         Ok(candidates) if !candidates.is_empty() => {
                             let quote_type =
@@ -225,7 +183,7 @@ pub(crate) fn gen_completions_internal(
                         Ok(_) => {
                             log::debug!(
                                 "No flyline completions found for command '{}'",
-                                full_command
+                                alias_expanded_full_command
                             );
                         }
                         Err(e) => {
@@ -234,18 +192,18 @@ pub(crate) fn gen_completions_internal(
                     }
                 } else {
                     let poss_completions = bash_funcs::run_programmable_completions(
-                        &full_command,
-                        &command_word,
-                        word_under_cursor.as_ref(),
-                        cursor_byte_pos,
-                        word_under_cursor_end,
+                        alias_expanded_full_command,
+                        &alias_expanded_command_word,
+                        alias_expanded_word_under_cursor,
+                        alias_expanded_cursor_byte_pos,
+                        alias_expanded_word_under_cursor_end,
                     );
 
                     match poss_completions {
                         Ok(comp_result) if !comp_result.completions.is_empty() => {
                             log::debug!(
                                 "Programmable completion results for command: {}",
-                                full_command
+                                alias_expanded_full_command
                             );
                             log::debug!("Completions: {:#?}", comp_result);
 
@@ -850,8 +808,7 @@ impl App<'_> {
                 self.buffer.buffer(),
                 self.buffer.cursor_byte_pos(),
             );
-            let some_suggestions =
-                gen_completions_internal(&comp_context);
+            let some_suggestions = gen_completions_internal(&comp_context);
 
             if some_suggestions.is_none() {
                 if expected_suggestions.is_empty() {
