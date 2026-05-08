@@ -149,10 +149,21 @@ impl DParser {
                 opening_idx: old_opening_idx,
                 is_auto_inserted: true,
             }) = &old.annotations.closing
-                && let Some(new_closing) = &mut new.annotations.closing
-                && *old_opening_idx == new_closing.opening_idx
             {
-                new_closing.is_auto_inserted = true;
+                match &mut new.annotations.closing {
+                    Some(new_closing) if *old_opening_idx == new_closing.opening_idx => {
+                        new_closing.is_auto_inserted = true;
+                    }
+                    None => {
+                        // Token kind isn't paired by dparser nesting (e.g. `]`).
+                        // Preserve the auto-inserted flag from the previous parse.
+                        new.annotations.closing = Some(ClosingAnnotation {
+                            opening_idx: *old_opening_idx,
+                            is_auto_inserted: true,
+                        });
+                    }
+                    _ => {}
+                }
             }
         }
 
@@ -162,12 +173,21 @@ impl DParser {
                 break;
             }
             if let Some(ClosingAnnotation {
+                opening_idx: old_opening_idx,
                 is_auto_inserted: true,
-                ..
             }) = &old.annotations.closing
-                && let Some(new_closing) = &mut new.annotations.closing
             {
-                new_closing.is_auto_inserted = true;
+                match &mut new.annotations.closing {
+                    Some(new_closing) => {
+                        new_closing.is_auto_inserted = true;
+                    }
+                    None => {
+                        new.annotations.closing = Some(ClosingAnnotation {
+                            opening_idx: *old_opening_idx,
+                            is_auto_inserted: true,
+                        });
+                    }
+                }
             }
         }
 
@@ -497,6 +517,21 @@ impl DParser {
                     });
                 }
 
+                // Redirection operators (`<`, `>`, `>>`, `<&`, `>&`, `<>`, `>|`).
+                // They never act as a command word and never start a new command;
+                // they just extend the current command range if one exists.
+                TokenKind::Less
+                | TokenKind::Great
+                | TokenKind::DGreat
+                | TokenKind::InputDup
+                | TokenKind::OutputDup
+                | TokenKind::ReadWrite
+                | TokenKind::Clobber => {
+                    if let Some(range) = &mut self.current_command_range {
+                        *range = *range.start()..=idx;
+                    }
+                }
+
                 // These keywords and operators introduce a new command; reset the command
                 // context so the first word after them receives the command_word annotation.
                 TokenKind::And
@@ -813,11 +848,21 @@ impl DParser {
         byte_pos: usize,
     ) -> bool {
         for token in tokens {
-            if token.token.byte_range().start == byte_pos
-                && token.token.value.starts_with(c)
-                && let Some(closing) = &mut token.annotations.closing
-            {
-                closing.is_auto_inserted = true;
+            if token.token.byte_range().start == byte_pos && token.token.value.starts_with(c) {
+                if let Some(closing) = &mut token.annotations.closing {
+                    closing.is_auto_inserted = true;
+                } else {
+                    // The token kind is not paired by the dparser nesting machinery
+                    // (e.g. `]`, which is intentionally not a nesting closer because
+                    // `[` does not start a nesting). Synthesize a closing annotation
+                    // purely so the auto-close machinery can recognise this token
+                    // as auto-inserted on the next keystroke. `opening_idx` is unused
+                    // for non-nested closers and is set to 0 as a placeholder.
+                    token.annotations.closing = Some(ClosingAnnotation {
+                        opening_idx: 0,
+                        is_auto_inserted: true,
+                    });
+                }
                 return true;
             }
         }
@@ -902,6 +947,21 @@ impl DParser {
 
         if is_before_word {
             return None;
+        }
+
+        // `[` in command position is the POSIX `[ ... ]` test command — the user
+        // will type `[ expr ]` themselves, so an auto-inserted `]` is in the way.
+        // Detect this by checking whether the freshly inserted `[` parsed as an
+        // `LBracket` token annotated as a command word.
+        if c == '[' {
+            let inserted_at_command_position = tokens.iter().any(|t| {
+                t.token.byte_range().start == just_inserted_pos
+                    && matches!(t.token.kind, TokenKind::LBracket)
+                    && t.annotations.command_word.is_some()
+            });
+            if inserted_at_command_position {
+                return None;
+            }
         }
 
         // Unambiguously opening characters – always auto-close.
@@ -1889,5 +1949,177 @@ mod tests {
             DParser::buffer_without_auto_inserted_suffix(&[], "echo hello"),
             "echo hello",
         );
+    }
+
+    // ---- redirection annotation tests ----
+
+    /// `foo 2>&1 bar`: `foo` is the command word, the redirection (`2`, `>&`, `1`)
+    /// and the trailing `bar` argument all sit inside that command's range, and
+    /// none of the redirect tokens become a command word of their own.
+    #[test]
+    fn test_redirect_2_and_1_does_not_break_command_word() {
+        let input = "foo 2>&1 bar";
+        let mut parser = DParser::from(input);
+        parser.walk_to_end();
+        let tokens = parser.tokens();
+
+        assert_eq!(tokens[0].token.value, "foo");
+        assert_eq!(tokens[0].annotations.command_word, Some("foo".to_string()));
+        // `2`, `>&`, `1`, `bar` should all have no command_word annotation.
+        for t in &tokens[1..] {
+            assert_eq!(t.annotations.command_word, None);
+        }
+
+        // The whole pipeline should be in one command range.
+        assert_eq!(parser.get_current_command_str(), "foo 2>&1 bar",);
+    }
+
+    /// `>&` must never act as a command word, even if no command precedes it.
+    #[test]
+    fn test_leading_redirect_op_is_not_command_word() {
+        for input in [
+            "> out cmd",
+            ">> out cmd",
+            "< in cmd",
+            ">& 2 cmd",
+            "<& 0 cmd",
+            "<> rw cmd",
+            ">| out cmd",
+        ] {
+            let tokens = DParser::parse_and_annotate(input);
+            for t in &tokens {
+                if matches!(
+                    t.token.kind,
+                    TokenKind::Less
+                        | TokenKind::Great
+                        | TokenKind::DGreat
+                        | TokenKind::InputDup
+                        | TokenKind::OutputDup
+                        | TokenKind::ReadWrite
+                        | TokenKind::Clobber
+                ) {
+                    assert!(
+                        t.annotations.command_word.is_none(),
+                        "redirect op {:?} in {input:?} should not be tagged as command_word",
+                        t.token.value
+                    );
+                }
+            }
+        }
+    }
+
+    /// In `ls | foo 2>&1 bar`, both `ls` and `foo` are command words; the
+    /// redirect tokens never are.
+    #[test]
+    fn test_redirect_after_pipe_keeps_command_word() {
+        let input = "ls | foo 2>&1 bar";
+        let tokens = DParser::parse_and_annotate(input);
+
+        let cmd_words: Vec<_> = tokens
+            .iter()
+            .filter_map(|t| t.annotations.command_word.as_deref())
+            .collect();
+        assert_eq!(cmd_words, vec!["ls", "foo"]);
+    }
+
+    /// `cat <input >output` — the redirects must not become command words and
+    /// the surrounding tokens must not be silently dropped from `cat`'s range.
+    #[test]
+    fn test_input_and_output_redirect_in_same_command() {
+        let input = "cat <input >output";
+        let mut parser = DParser::from(input);
+        parser.walk_to_end();
+        let tokens = parser.tokens();
+
+        assert_eq!(tokens[0].annotations.command_word, Some("cat".to_string()));
+        for t in &tokens[1..] {
+            assert_eq!(t.annotations.command_word, None);
+        }
+        assert_eq!(parser.get_current_command_str(), input);
+    }
+
+    // ---- [ / ] lexer-token tests (after flash upgrade) ----
+
+    /// After the flash upgrade, a bare `[` is a dedicated `LBracket` token
+    /// (no longer `Word("[")`) and `]` is a dedicated `RBracket` token. The
+    /// dparser must keep working with both.
+    #[test]
+    fn test_single_brackets_are_lbracket_rbracket() {
+        let tokens = collect_tokens_include_whitespace("[ -f x ]");
+        assert_eq!(tokens[0].kind, TokenKind::LBracket);
+        assert_eq!(tokens[0].value, "[");
+        // ` `, `-f`, ` `, `x`, ` `, `]`
+        assert_eq!(tokens.last().unwrap().kind, TokenKind::RBracket);
+        assert_eq!(tokens.last().unwrap().value, "]");
+    }
+
+    /// `[` is never a nesting opener — neither at command position nor as
+    /// an argument. `[ foo` is a complete command (the POSIX `[` builtin
+    /// will run and complain at runtime). The opening `[` is annotated as
+    /// the command word.
+    #[test]
+    fn test_single_bracket_is_not_a_nesting_opener() {
+        let input = "[ foo";
+        let mut parser = DParser::from(input);
+        parser.walk_to_end();
+        let tokens = parser.tokens();
+
+        assert_eq!(tokens[0].token.kind, TokenKind::LBracket);
+        assert_eq!(tokens[0].annotations.command_word, Some("[".to_string()));
+        assert_eq!(tokens[0].annotations.opening, None);
+        assert!(!parser.needs_more_input());
+    }
+
+    /// `[` after a command word is not a nesting opener either: it's just a
+    /// regular argument. `echo [ grep ]` has `echo` as the only command
+    /// word; `[`, `grep` and `]` are arguments with no command_word
+    /// annotation and no opening/closing annotations.
+    #[test]
+    fn test_single_bracket_after_command_is_argument_only() {
+        let input = "echo [ grep ]";
+        let mut parser = DParser::from(input);
+        parser.walk_to_end();
+        let tokens = parser.tokens();
+
+        assert_eq!(tokens[0].annotations.command_word, Some("echo".to_string()));
+        for t in &tokens[1..] {
+            assert_eq!(t.annotations.command_word, None);
+            assert_eq!(t.annotations.opening, None);
+            assert_eq!(t.annotations.closing, None);
+        }
+        assert!(!parser.needs_more_input());
+        assert_eq!(parser.get_current_command_str(), input);
+    }
+
+    /// `[[` (DoubleLBracket) IS a nesting opener and must be matched with `]]`.
+    #[test]
+    fn test_double_bracket_is_a_nesting_opener() {
+        let input = "[[ 1 == 1 ]]";
+        let mut parser = DParser::from(input);
+        parser.walk_to_end();
+        let tokens = parser.tokens();
+
+        assert_eq!(tokens[0].token.kind, TokenKind::DoubleLBracket);
+        let last_idx = tokens.len() - 1;
+        assert_eq!(tokens[last_idx].token.kind, TokenKind::DoubleRBracket);
+        assert_eq!(
+            tokens[0].annotations.opening,
+            Some(OpeningState::Matched(last_idx))
+        );
+        assert_eq!(
+            tokens[last_idx].annotations.closing,
+            Some(ClosingAnnotation {
+                opening_idx: 0,
+                is_auto_inserted: false
+            })
+        );
+    }
+
+    /// Unclosed `[[` leaves the parser asking for more input.
+    #[test]
+    fn test_unclosed_double_bracket_needs_more_input() {
+        let mut parser = DParser::from("[[ 1 == 1");
+        parser.walk_to_end();
+        assert!(parser.needs_more_input());
     }
 }

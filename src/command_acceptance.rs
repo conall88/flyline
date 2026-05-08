@@ -315,6 +315,22 @@ mod tests {
     }
 
     #[test]
+    fn test_single_bracket_test_command() {
+        // `[ foo` is a syntactically complete command (the `[` builtin will run
+        // and complain at runtime, but bash does not ask for more input).
+        // `[` must therefore not introduce a nesting that needs `]` to close.
+        assert_eq!(will_bash_accept_buffer("[ foo"), true);
+        assert_eq!(will_bash_accept_buffer("[ -f file ]"), true);
+    }
+
+    #[test]
+    fn test_double_bracket_needs_closing() {
+        // `[[ ... ]]` is a real conditional expression and must be closed.
+        assert_eq!(will_bash_accept_buffer("[[ 1 == 1"), false);
+        assert_eq!(will_bash_accept_buffer("[[ 1 == 1 ]]"), true);
+    }
+
+    #[test]
     fn test_quote_start_mid_word() {
         assert_eq!(will_bash_accept_buffer(r#"a ['"#), false);
         assert_eq!(will_bash_accept_buffer(r#"a [""#), false);

@@ -294,4 +294,101 @@ mod tests {
 
         let _ = tokens;
     }
+
+    // ---- square-bracket auto-close tests (after flash upgrade) ----
+
+    #[test]
+    fn inserting_open_square_bracket_after_command_inserts_closing_and_positions_cursor_inside() {
+        // `[` after a command word is a regular argument and should auto-close.
+        let mut buffer = TextBuffer::new("echo ");
+        let mut tokens = parsed(buffer.buffer());
+
+        handle_char_insertion(&mut buffer, &mut tokens, '[');
+
+        assert_eq!(buffer.buffer(), "echo []");
+        assert_eq!(buffer.cursor_byte_pos(), 6);
+    }
+
+    #[test]
+    fn inserting_close_square_bracket_over_auto_inserted_one_moves_cursor_without_duplicating() {
+        let mut buffer = TextBuffer::new("echo ");
+        let mut tokens = parsed(buffer.buffer());
+
+        handle_char_insertion(&mut buffer, &mut tokens, '[');
+        assert_eq!(buffer.buffer(), "echo []");
+        assert_eq!(buffer.cursor_byte_pos(), 6);
+
+        handle_char_insertion(&mut buffer, &mut tokens, ']');
+        assert_eq!(buffer.buffer(), "echo []");
+        assert_eq!(buffer.cursor_byte_pos(), 7);
+    }
+
+    #[test]
+    fn backspace_on_open_square_bracket_also_removes_auto_inserted_close() {
+        let mut buffer = TextBuffer::new("echo ");
+        let mut tokens = parsed(buffer.buffer());
+
+        handle_char_insertion(&mut buffer, &mut tokens, '[');
+        assert_eq!(buffer.buffer(), "echo []");
+
+        delete_auto_inserted_closing_if_present(&mut buffer, &tokens);
+        buffer.delete_left();
+        let tokens =
+            dparser::DParser::parse_and_transfer_auto_inserted_flags(buffer.buffer(), &tokens);
+
+        assert_eq!(buffer.buffer(), "echo ");
+        assert_eq!(buffer.cursor_byte_pos(), 5);
+        let _ = tokens;
+    }
+
+    #[test]
+    fn open_square_bracket_at_start_of_command_is_not_autoclosed() {
+        // At any command position (here: empty buffer; see the pipe/semicolon
+        // tests below for the other cases) `[` is the POSIX `[` test command —
+        // the user types `[ ... ]` themselves so we must not auto-insert `]`.
+        let mut buffer = TextBuffer::new("");
+        let mut tokens = parsed(buffer.buffer());
+
+        handle_char_insertion(&mut buffer, &mut tokens, '[');
+
+        assert_eq!(buffer.buffer(), "[");
+        assert_eq!(buffer.cursor_byte_pos(), 1);
+    }
+
+    #[test]
+    fn open_square_bracket_after_pipe_is_in_command_position_and_not_autoclosed() {
+        // After a pipe, the next word is a fresh command — so `[` is again at
+        // command position and must not be auto-closed.
+        let mut buffer = TextBuffer::new("echo hi | ");
+        let mut tokens = parsed(buffer.buffer());
+
+        handle_char_insertion(&mut buffer, &mut tokens, '[');
+
+        assert_eq!(buffer.buffer(), "echo hi | [");
+        assert_eq!(buffer.cursor_byte_pos(), 11);
+    }
+
+    #[test]
+    fn open_square_bracket_after_semicolon_is_in_command_position_and_not_autoclosed() {
+        let mut buffer = TextBuffer::new("echo hi; ");
+        let mut tokens = parsed(buffer.buffer());
+
+        handle_char_insertion(&mut buffer, &mut tokens, '[');
+
+        assert_eq!(buffer.buffer(), "echo hi; [");
+        assert_eq!(buffer.cursor_byte_pos(), 10);
+    }
+
+    #[test]
+    fn open_square_bracket_in_middle_of_argument_list_is_autoclosed() {
+        // `[` after an existing argument is not in command position and should
+        // be auto-closed like any other `[` opener.
+        let mut buffer = TextBuffer::new("ls -l ");
+        let mut tokens = parsed(buffer.buffer());
+
+        handle_char_insertion(&mut buffer, &mut tokens, '[');
+
+        assert_eq!(buffer.buffer(), "ls -l []");
+        assert_eq!(buffer.cursor_byte_pos(), 7);
+    }
 }
