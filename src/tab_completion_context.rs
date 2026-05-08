@@ -7,8 +7,10 @@ use crate::{
     text_buffer::SubString,
 };
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Default)]
 pub enum CompType {
+    #[default]
+    None,
     FirstWord,      // the first word under the cursor. cursor might be in the middle of it
     FuzzyFirstWord, // fuzzy-match commands when FirstWord prefix-matching finds nothing
     CommandComp {
@@ -31,6 +33,21 @@ pub enum CompType {
 impl CompType {
     pub fn is_glob_pattern(s: &str) -> bool {
         globbing::is_glob_pattern(s)
+    }
+
+    pub fn display_name(&self) -> &str {
+        match self {
+            CompType::None => "None",
+            CompType::FirstWord => "FirstWord",
+            CompType::FuzzyFirstWord => "FuzzyFirstWord",
+            CompType::CommandComp { .. } => "CommandComp",
+            CompType::FuzzyCommandComp { .. } => "FuzzyCommandComp",
+            CompType::EnvVariable => "EnvVariable",
+            CompType::TildeExpansion => "TildeExpansion",
+            CompType::GlobExpansion => "GlobExpansion",
+            CompType::FilenameExpansion => "FilenameExpansion",
+            CompType::FuzzyFilenameExpansion => "FuzzyFilenameExpansion",
+        }
     }
 }
 
@@ -172,6 +189,37 @@ impl<'a> CompletionContext<'a> {
         self.word_under_cursor
             .end()
             .saturating_sub(self.context.start)
+    }
+
+    pub fn word_left_of_cursor(&self) -> &str {
+        match self
+            .buffer
+            .get(self.word_under_cursor.start..self.cursor_byte_pos)
+        {
+            Some(s) => s,
+            None => "",
+        }
+    }
+
+    pub fn word_right_of_cursor(&self) -> &str {
+        match self
+            .buffer
+            .get(self.cursor_byte_pos..self.word_under_cursor.end())
+        {
+            Some(s) => s,
+            None => "",
+        }
+    }
+
+    pub fn with_cursor_at_end_of_wuc(&'a self) -> CompletionContext<'a> {
+        let cursor_byte_pos = self.word_under_cursor.end();
+        CompletionContext {
+            buffer: self.buffer.clone(),
+            context: self.context.clone(),
+            cursor_byte_pos,
+            word_under_cursor: self.word_under_cursor.clone(),
+            comp_types: self.comp_types.clone(),
+        }
     }
 
     pub fn with_expanded_alias(&self, alias_def: &str) -> CompletionContext<'static> {
@@ -353,6 +401,13 @@ pub fn get_completion_context<'a>(
                     _ => break,
                 }
             }
+
+            // if let Some(cursor_to_end) = buffer.get(cursor_byte_pos..end) {
+            //     // if there is a / in cursor_to_end, move the end closer to cursor so that we dont have the /
+            //     if let Some(slash_pos) = cursor_to_end.find('/') {
+            //         end = cursor_byte_pos + slash_pos;
+            //     }
+            // }
 
             start..end
         }

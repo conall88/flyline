@@ -1,4 +1,3 @@
-use crate::bash_funcs;
 use crate::content_utils::{
     ansi_string_to_spans, highlight_matching_indices, middle_truncate_spans, style_for_path,
     take_prefix_of_spans, ts_to_timeago_string_5chars, vec_spans_width,
@@ -6,6 +5,7 @@ use crate::content_utils::{
 use crate::palette::Palette;
 use crate::stateful_sliding_window::StatefulSlidingWindow;
 use crate::text_buffer::{SubString, TextBuffer};
+use crate::{bash_funcs, tab_completion_context};
 use itertools::Itertools;
 use ratatui::prelude::*;
 use skim::fuzzy_matcher::FuzzyMatcher;
@@ -653,6 +653,7 @@ pub struct ActiveSuggestionsBuilder {
     pub unprocessed: VecDeque<UnprocessedSuggestion>,
     pub auto_accept_if_solo: bool,
     pub common_prefix: Option<String>,
+    pub comp_type: tab_completion_context::CompType,
 }
 
 impl ActiveSuggestionsBuilder {
@@ -664,6 +665,7 @@ impl ActiveSuggestionsBuilder {
             unprocessed: VecDeque::new(),
             auto_accept_if_solo: true,
             common_prefix: None,
+            comp_type: tab_completion_context::CompType::default(),
         }
     }
 
@@ -672,6 +674,11 @@ impl ActiveSuggestionsBuilder {
     /// single candidate survives the fuzzy scoring.
     pub fn with_auto_accept_if_solo(mut self, auto_accept_if_solo: bool) -> Self {
         self.auto_accept_if_solo = auto_accept_if_solo;
+        self
+    }
+
+    pub fn with_comp_type(mut self, comp_type: tab_completion_context::CompType) -> Self {
+        self.comp_type = comp_type;
         self
     }
 
@@ -811,6 +818,7 @@ pub struct ActiveSuggestions {
     fuzzy_matcher: ArinaeMatcher,
     /// How long it took to generate the completions.
     pub load_time: std::time::Duration,
+    pub comp_type: tab_completion_context::CompType,
 }
 
 impl ActiveSuggestions {
@@ -824,6 +832,7 @@ impl ActiveSuggestions {
             unprocessed: unprocessed_suggestions,
             common_prefix: _,
             auto_accept_if_solo: _,
+            comp_type,
         } = builder;
         let sug_len = processed_suggestions.len() + unprocessed_suggestions.len();
 
@@ -841,6 +850,7 @@ impl ActiveSuggestions {
             col_window_to_show: StatefulSlidingWindow::new(0, 1, sug_len, Some(1)),
             fuzzy_matcher: ArinaeMatcher::new(skim::CaseMatching::Smart, true),
             load_time,
+            comp_type,
         };
 
         active_sug.update_fuzzy_filtered();
@@ -880,7 +890,7 @@ impl ActiveSuggestions {
     }
 
     /// Return the flat (1-D) index of the currently-selected suggestion.
-    fn current_1d_index(&self) -> usize {
+    pub fn current_1d_index(&self) -> usize {
         self.selected_col
             .saturating_mul(self.last_num_rows_per_col)
             .saturating_add(self.selected_row)

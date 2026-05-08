@@ -10,6 +10,7 @@ use crate::bash_funcs::{self, QuoteType};
 use crate::content_utils::{self, ansi_string_to_spans};
 use crate::globbing::PathPatternExpansion;
 use crate::iter_first_last::FirstLast;
+use crate::tab_completion_context::CompType;
 use crate::text_buffer::SubString;
 use crate::users;
 use crate::{cli::complete_flyline_args, tab_completion_context};
@@ -59,7 +60,9 @@ fn run_comp_spec_completion(
         .as_deref()
         .filter(|alias| !alias.is_empty())
         .unwrap_or(initial_command_word);
-    let alias_expanded_completion_context = completion_context.with_expanded_alias(alias_def);
+    let alias_expanded_completion_context = completion_context
+        .with_cursor_at_end_of_wuc()
+        .with_expanded_alias(alias_def);
     let alias_expanded_command_word = alias_def
         .split_whitespace()
         .next()
@@ -74,80 +77,7 @@ fn run_comp_spec_completion(
         alias_expanded_completion_context.word_under_cursor_end_context_relative();
 
     if alias_expanded_command_word == "flyline" {
-        // Flyline's own subcommand/flag completions are produced by
-        // clap_complete and are already escaped/finalized. Skip the
-        // bash post-processing pipeline entirely and build
-        // ProcssedSuggestions directly so descriptions (the help text
-        // attached to each candidate) are preserved as-is.
-        match complete_flyline_args(
-            alias_expanded_full_command,
-            alias_expanded_word_under_cursor,
-            alias_expanded_cursor_byte_pos,
-        ) {
-            Ok(candidates) if !candidates.is_empty() => {
-                let quote_type = bash_funcs::find_quote_type(alias_expanded_word_under_cursor);
-
-                let processed: Vec<ProcessedSuggestion> = candidates
-                    .into_iter()
-                    .filter_map(|c| {
-                        let value = c.get_value().to_string_lossy().to_string();
-                        let value = if let Some(qt) = quote_type {
-                            bash_funcs::quoting_function_rust(&value, qt, true, false)
-                        } else {
-                            value.clone()
-                        };
-                        let (value, suffix) =
-                            if let Some(stripped) = value.strip_suffix("NO_SUFFIX") {
-                                (stripped.to_string(), "")
-                            } else {
-                                (value, " ")
-                            };
-                        let (prefix, value) = if let Some(delim_pos) = value.find("PREFIX_DELIM") {
-                            let p = value[..delim_pos].to_string();
-                            let v = value[delim_pos + "PREFIX_DELIM".len()..].to_string();
-                            (p, v)
-                        } else {
-                            (String::new(), value)
-                        };
-
-                        let description = match c.get_help() {
-                            Some(h) => {
-                                let ansi_help = format!("{}", h.ansi());
-                                SuggestionDescription::Animation(
-                                    ansi_help
-                                        .split('\t')
-                                        .map(|s| ansi_string_to_spans(s))
-                                        .collect(),
-                                )
-                            }
-                            None => SuggestionDescription::Static(vec![]),
-                        };
-
-                        Some(
-                            ProcessedSuggestion::new(&value, prefix, suffix)
-                                .with_description(description),
-                        )
-                    })
-                    .collect();
-
-                if processed.is_empty() {
-                    return None;
-                }
-
-                Some(ActiveSuggestionsBuilder::from_processed(processed))
-            }
-            Ok(_) => {
-                log::debug!(
-                    "No flyline completions found for command '{}'",
-                    alias_expanded_full_command
-                );
-                None
-            }
-            Err(e) => {
-                log::error!("Error generating flyline completions: {}", e);
-                None
-            }
-        }
+        run_flyline_compspec(alias_expanded_completion_context)
     } else {
         let poss_completions = bash_funcs::run_programmable_completions(
             alias_expanded_full_command,
@@ -158,7 +88,7 @@ fn run_comp_spec_completion(
         );
 
         match poss_completions {
-            Ok(comp_result) if !comp_result.completions.is_empty() => {
+            Ok(comp_result) => {
                 log::debug!(
                     "Programmable completion results for command: {}",
                     alias_expanded_full_command
@@ -177,8 +107,74 @@ fn run_comp_spec_completion(
                         }),
                 ))
             }
-            Ok(_) => None,
             _ => None,
+        }
+    }
+}
+
+fn run_flyline_compspec(
+    completion_context: tab_completion_context::CompletionContext,
+) -> Option<ActiveSuggestionsBuilder> {
+    let full_command = completion_context.context.as_ref();
+    let cursor_byte_pos = completion_context.cursor_byte_pos_context_relative();
+    let word_under_cursor = completion_context.word_under_cursor.as_ref();
+
+    // Flyline's own subcommand/flag completions are produced by
+    // clap_complete and are already escaped/finalized. Skip the
+    // bash post-processing pipeline entirely and build
+    // ProcssedSuggestions directly so descriptions (the help text
+    // attached to each candidate) are preserved as-is.
+    match complete_flyline_args(full_command, word_under_cursor, cursor_byte_pos) {
+        Ok(candidates) => {
+            let quote_type = bash_funcs::find_quote_type(word_under_cursor);
+
+            let processed: Vec<ProcessedSuggestion> = candidates
+                .into_iter()
+                .filter_map(|c| {
+                    let value = c.get_value().to_string_lossy().to_string();
+                    let value = if let Some(qt) = quote_type {
+                        bash_funcs::quoting_function_rust(&value, qt, true, false)
+                    } else {
+                        value.clone()
+                    };
+                    let (value, suffix) = if let Some(stripped) = value.strip_suffix("NO_SUFFIX") {
+                        (stripped.to_string(), "")
+                    } else {
+                        (value, " ")
+                    };
+                    let (prefix, value) = if let Some(delim_pos) = value.find("PREFIX_DELIM") {
+                        let p = value[..delim_pos].to_string();
+                        let v = value[delim_pos + "PREFIX_DELIM".len()..].to_string();
+                        (p, v)
+                    } else {
+                        (String::new(), value)
+                    };
+
+                    let description = match c.get_help() {
+                        Some(h) => {
+                            let ansi_help = format!("{}", h.ansi());
+                            SuggestionDescription::Animation(
+                                ansi_help
+                                    .split('\t')
+                                    .map(|s| ansi_string_to_spans(s))
+                                    .collect(),
+                            )
+                        }
+                        None => SuggestionDescription::Static(vec![]),
+                    };
+
+                    Some(
+                        ProcessedSuggestion::new(&value, prefix, suffix)
+                            .with_description(description),
+                    )
+                })
+                .collect();
+
+            Some(ActiveSuggestionsBuilder::from_processed(processed))
+        }
+        Err(e) => {
+            log::error!("Error generating flyline completions: {}", e);
+            None
         }
     }
 }
@@ -225,7 +221,11 @@ fn gen_completions_uncomitted(
     for comp_type in &completion_context.comp_types {
         log::debug!("Processing completion type: {:?}", comp_type);
         match comp_type {
-            tab_completion_context::CompType::FirstWord => {
+            CompType::None => {
+                log::debug!("CompType::None, skipping to next CompType");
+                continue;
+            }
+            CompType::FirstWord => {
                 log::debug!("CompType::FirstWord for: {}", word_under_cursor.as_ref());
                 let completions = tab_complete_first_word(word_under_cursor.as_ref());
                 log::debug!(
@@ -234,10 +234,10 @@ fn gen_completions_uncomitted(
                     word_under_cursor.as_ref()
                 );
                 if !completions.is_empty() {
-                    return Some(completions);
+                    return Some(completions.with_comp_type(comp_type.clone()));
                 }
             }
-            tab_completion_context::CompType::FuzzyFirstWord => {
+            CompType::FuzzyFirstWord => {
                 log::debug!(
                     "CompType::FuzzyFirstWord for: {}",
                     word_under_cursor.as_ref()
@@ -249,10 +249,10 @@ fn gen_completions_uncomitted(
                     word_under_cursor.as_ref()
                 );
                 if !completions.is_empty() {
-                    return Some(completions);
+                    return Some(completions.with_comp_type(comp_type.clone()));
                 }
             }
-            tab_completion_context::CompType::CommandComp {
+            CompType::CommandComp {
                 command_word: initial_command_word,
             } => {
                 // This isn't just for commands like `git`, `cargo`
@@ -265,11 +265,18 @@ fn gen_completions_uncomitted(
                 if let Some(builder) =
                     run_comp_spec_completion(completion_context, initial_command_word)
                 {
-                    return Some(builder);
+                    log::debug!(
+                        "CompType::CommandComp found {} completions for command word: {}",
+                        builder.len(),
+                        initial_command_word
+                    );
+                    if !builder.is_empty() {
+                        return Some(builder.with_comp_type(comp_type.clone()));
+                    }
                 }
             }
 
-            tab_completion_context::CompType::FuzzyCommandComp {
+            CompType::FuzzyCommandComp {
                 command_word: initial_command_word,
             } => {
                 let original_wuc = word_under_cursor.as_ref();
@@ -336,12 +343,12 @@ fn gen_completions_uncomitted(
                         pattern
                     );
                     if !builder.is_empty() {
-                        return Some(builder);
+                        return Some(builder.with_comp_type(comp_type.clone()));
                     }
                 }
             }
 
-            tab_completion_context::CompType::EnvVariable => {
+            CompType::EnvVariable => {
                 log::debug!("CompType::EnvVariable for {}", word_under_cursor.as_ref());
                 let matching_vars =
                     bash_funcs::get_all_variables_with_prefix(word_under_cursor.as_ref());
@@ -351,12 +358,15 @@ fn gen_completions_uncomitted(
                     word_under_cursor.as_ref()
                 );
                 if !matching_vars.is_empty() {
-                    return Some(ActiveSuggestionsBuilder::from_processed(
-                        ProcessedSuggestion::from_string_vec(matching_vars, "", " "),
-                    ));
+                    return Some(
+                        ActiveSuggestionsBuilder::from_processed(
+                            ProcessedSuggestion::from_string_vec(matching_vars, "", " "),
+                        )
+                        .with_comp_type(comp_type.clone()),
+                    );
                 }
             }
-            tab_completion_context::CompType::TildeExpansion => {
+            CompType::TildeExpansion => {
                 log::debug!(
                     "CompType::TildeExpansion for {}",
                     word_under_cursor.as_ref()
@@ -368,10 +378,13 @@ fn gen_completions_uncomitted(
                     word_under_cursor.as_ref()
                 );
                 if !completions.is_empty() {
-                    return Some(ActiveSuggestionsBuilder::from_processed(completions));
+                    return Some(
+                        ActiveSuggestionsBuilder::from_processed(completions)
+                            .with_comp_type(comp_type.clone()),
+                    );
                 }
             }
-            tab_completion_context::CompType::GlobExpansion => {
+            CompType::GlobExpansion => {
                 log::debug!("CompType::GlobExpansion for {}", word_under_cursor.as_ref());
                 let (completions, comp_res_flags) =
                     tab_complete_glob_expansion(word_under_cursor.as_ref());
@@ -385,7 +398,10 @@ fn gen_completions_uncomitted(
                     [] => {}
                     [single_completion] => {
                         let processed = single_completion.clone().into_processed();
-                        return Some(ActiveSuggestionsBuilder::from_processed([processed]));
+                        return Some(
+                            ActiveSuggestionsBuilder::from_processed([processed])
+                                .with_comp_type(comp_type.clone()),
+                        );
                     }
                     _ => {
                         // Unlike other completions, if there are multiple glob completions,
@@ -419,19 +435,27 @@ fn gen_completions_uncomitted(
                                 acc
                             },
                         );
-                        return Some(ActiveSuggestionsBuilder::from_processed([
-                            ProcessedSuggestion::new(completions_as_string, "", ""),
-                        ]));
+                        return Some(
+                            ActiveSuggestionsBuilder::from_processed([ProcessedSuggestion::new(
+                                completions_as_string,
+                                "",
+                                "",
+                            )])
+                            .with_comp_type(comp_type.clone()),
+                        );
                     }
                 }
             }
-            tab_completion_context::CompType::FilenameExpansion => {
+            CompType::FilenameExpansion => {
                 log::debug!(
                     "CompType::FilenameExpansion for: {}",
                     word_under_cursor.as_ref()
                 );
-                let (completions, _comp_res_flags) =
-                    tab_complete_glob_expansion(&(word_under_cursor.as_ref().to_string() + "*"));
+                let (completions, _comp_res_flags) = tab_complete_glob_expansion(
+                    &(completion_context.word_left_of_cursor().to_string()
+                        + "*"
+                        + completion_context.word_right_of_cursor()),
+                );
 
                 log::debug!(
                     "CompType::FilenameExpansion found {} completions for pattern: {}",
@@ -439,10 +463,13 @@ fn gen_completions_uncomitted(
                     word_under_cursor.as_ref()
                 );
                 if !completions.is_empty() {
-                    return Some(ActiveSuggestionsBuilder::from_unprocessed(completions));
+                    return Some(
+                        ActiveSuggestionsBuilder::from_unprocessed(completions)
+                            .with_comp_type(comp_type.clone()),
+                    );
                 }
             }
-            tab_completion_context::CompType::FuzzyFilenameExpansion => {
+            CompType::FuzzyFilenameExpansion => {
                 log::debug!(
                     "CompType::FuzzyFilenameExpansion for: {}",
                     word_under_cursor.as_ref()
@@ -458,7 +485,8 @@ fn gen_completions_uncomitted(
                 if !completions.is_empty() {
                     return Some(
                         ActiveSuggestionsBuilder::from_unprocessed(completions)
-                            .with_auto_accept_if_solo(false),
+                            .with_auto_accept_if_solo(false)
+                            .with_comp_type(comp_type.clone()),
                     );
                 }
             }
@@ -753,6 +781,7 @@ fn tab_complete_tilde_expansion(pattern: &str) -> Vec<ProcessedSuggestion> {
 ///
 /// This is the buffer-mutation half of `finish_tab_complete` factored out so
 /// it can be exercised from unit tests without constructing a full `App`.
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub(crate) enum TabCompleteBufferOutcome {
     /// We auto-accepted a single suggestion; the caller (the App) should
     /// switch back to `ContentMode::Normal` and discard the builder.
@@ -916,7 +945,7 @@ impl App<'_> {
 mod tab_completion_tests {
     use super::*;
     use crate::active_suggestions::ProcessedSuggestion;
-    use crate::tab_completion_context::get_completion_context;
+    use crate::tab_completion_context::{CompletionContext, get_completion_context};
     use crate::text_buffer::TextBuffer;
     use rusty_fork::rusty_fork_test;
 
@@ -946,10 +975,32 @@ mod tab_completion_tests {
     /// string), drain anything still queued, then return the processed
     /// suggestions sorted by `s` for stable comparison.
     fn run_completion(command: &str) -> Vec<ProcessedSuggestion> {
-        crate::logging::init_for_tests_once();
         let buffer = TextBuffer::new(command);
+        run_completion_from_buffer(&buffer)
+    }
+
+    fn get_builder(
+        command: &str,
+    ) -> Option<(ActiveSuggestionsBuilder, CompletionContext<'static>)> {
+        let buffer = TextBuffer::new(command);
+        get_builder_from_buffer(&buffer)
+    }
+
+    fn get_builder_from_buffer(
+        buffer: &TextBuffer,
+    ) -> Option<(ActiveSuggestionsBuilder, CompletionContext<'static>)> {
+        crate::logging::init_for_tests_once();
         let comp_context = get_completion_context(buffer.buffer(), buffer.cursor_byte_pos());
         let Some(builder) = gen_completions_internal(&comp_context) else {
+            return None;
+        };
+        Some((builder, comp_context.into_owned()))
+    }
+
+    fn run_completion_from_buffer(buffer: &TextBuffer) -> Vec<ProcessedSuggestion> {
+        crate::logging::init_for_tests_once();
+
+        let Some((builder, _)) = get_builder_from_buffer(buffer) else {
             return Vec::new();
         };
         let mut suggestions: Vec<ProcessedSuggestion> = builder.processed;
@@ -959,20 +1010,23 @@ mod tab_completion_tests {
 
     fn assert_completions(command: &str, expected: &[ProcessedSuggestion]) {
         let actual = run_completion(command);
+        assert_processed(&actual, expected);
+    }
+
+    fn assert_processed(actual: &[ProcessedSuggestion], expected: &[ProcessedSuggestion]) {
         assert_eq!(
             actual.len(),
             expected.len(),
-            "completion count mismatch for command {:?}: got {:?}, expected {:?}",
-            command,
+            "completion count mismatch: got {:?}, expected {:?}",
             actual,
             expected
         );
+        // Dont check the description since mtime is hard to test
         for (got, want) in actual.iter().zip(expected.iter()) {
             assert_eq!(
                 (&got.prefix, &got.s, &got.suffix),
                 (&want.prefix, &want.s, &want.suffix),
-                "for command {:?}: got {:?}, expected {:?}",
-                command,
+                "got {:?}, expected {:?}",
                 got,
                 want
             );
@@ -1041,13 +1095,42 @@ mod tab_completion_tests {
             }
         }
 
+        #[test]
+        fn git_diff_dashdash_lists_long_flags_mid_word() {
+            cd_to_example_fs();
+            let mut buffer = TextBuffer::new("git diff --stag");
+
+            // It doesnt matter where the cursor is because I always move it to the end
+            // This gives best results since it allows the FuzzyCommandComp and Filname (that uses mid word information)
+            // to run.
+
+            buffer.move_to_end(); // --stag|
+            buffer.move_left();   // --sta|g
+            buffer.move_left();   // --st|ag
+            let actual = run_completion_from_buffer(&buffer);
+            let names: Vec<&str> = actual.iter().map(|s| s.s.as_str()).collect();
+            for flag in ["--staged"] {
+                assert!(names.contains(&flag), "expected {flag} in {:?}", names);
+            }
+
+            // If we didnt move the cursor to the end,
+            // we would get the same results as this one:
+            let buffer = TextBuffer::new("git diff --st");
+            let actual = run_completion_from_buffer(&buffer);
+            let names: Vec<&str> = actual.iter().map(|s| s.s.as_str()).collect();
+            for flag in ["--staged", "--stat"] {
+                assert!(names.contains(&flag), "expected {flag} in {:?}", names);
+            }
+        }
+
         // ------- dummy git completion fuzzy matching
-        /// This tests the [crate::tab_completion_context::CompType::FuzzyCommandComp] branch where we re-run the
+        /// This tests the [crate::CompType::FuzzyCommandComp] branch where we re-run the
         #[test]
         fn git_commit_fuzzy_command_comp() {
             cd_to_example_fs();
-            let actual = run_completion("git cmomit"); // Typo of commit
-            let names: Vec<&str> = actual.iter().map(|s| s.s.as_str()).collect();
+            let builder = get_builder("git cmomit").unwrap().0; // Typo of commit
+            assert_eq!(builder.comp_type, CompType::FuzzyCommandComp { command_word: "git".to_string() });
+            let names: Vec<&str> = builder.processed.iter().map(|s| s.s.as_str()).collect();
             for flag in ["commit"] {
                 assert!(names.contains(&flag), "expected {flag} in {:?}", names);
             }
@@ -1056,9 +1139,10 @@ mod tab_completion_tests {
         #[test]
         fn git_commit_fuzzy_command_comp_fallback_if_not_found() {
             cd_to_example_fs();
-            let actual = run_completion("git symlinktfoo"); // This one should fall back to filenames
-            assert_eq!(actual.len(), 1);
-            assert_eq!(actual[0].s, "sym_link_to_foo/");
+            let builder = get_builder("git symlinktfoo").unwrap().0; // This one should fall back to filenames
+            assert_eq!(builder.comp_type, CompType::FuzzyFilenameExpansion);
+            assert_eq!(builder.len(), 1);
+            assert_eq!(builder.processed[0].s, "sym_link_to_foo/");
         }
 
         // ------- alias expansion (find_alias / get_all_aliases) ----------
@@ -1075,6 +1159,7 @@ mod tab_completion_tests {
                 get_completion_context(buffer.buffer(), buffer.cursor_byte_pos());
             let wuc = comp_context.word_under_cursor.clone();
             let builder = gen_completions_internal(&comp_context).expect("some completions");
+            assert_eq!(builder.comp_type, CompType::CommandComp { command_word: "gd".to_string() });
             assert_eq!(builder.len(), 1, "expected solo suggestion, got {:?}", builder.processed);
             let outcome = apply_tab_complete_to_buffer(&mut buffer, &builder, &wuc);
             assert!(matches!(outcome, TabCompleteBufferOutcome::SoloAccepted));
@@ -1146,19 +1231,111 @@ mod tab_completion_tests {
             );
         }
 
+
+        #[test]
+        fn mid_word_completion() {
+            cd_to_example_fs();
+            let mut buffer = TextBuffer::new("mycmd ./abc/f/baz");
+            buffer.move_left();
+            buffer.move_left();
+            buffer.move_left();
+            buffer.move_left(); // cursor is now right after f
+
+
+            let (builder, comp_context) = get_builder_from_buffer(&buffer).unwrap();
+            assert_eq!(builder.comp_type, CompType::FilenameExpansion);
+            assert_processed(
+                &builder.processed,
+                &[ProcessedSuggestion::new(
+                    "./abc/foo/baz",
+                    "",
+                    " ",
+                )],
+            );
+
+            let outcome = apply_tab_complete_to_buffer(&mut buffer, &builder, &comp_context.word_under_cursor);
+            assert!(matches!(outcome, TabCompleteBufferOutcome::SoloAccepted));
+            assert_eq!(buffer.buffer(), "mycmd ./abc/foo/baz ");
+        }
+
+        #[test]
+        fn mid_word_completion_multiple() {
+            cd_to_example_braces_fs();
+            let mut buffer = TextBuffer::new("mycmd ./fo/barA");
+            buffer.move_left();
+            buffer.move_left();
+            buffer.move_left();
+            buffer.move_left();
+            buffer.move_left(); // cursor is now right after f
+
+
+            let (builder, comp_context) = get_builder_from_buffer(&buffer).unwrap();
+            assert_eq!(builder.comp_type, CompType::FilenameExpansion);
+            assert_processed(
+                &builder.processed,
+                &[ProcessedSuggestion::new(
+                    "./foo1/barA",
+                    "",
+                    " ",
+                ),ProcessedSuggestion::new(
+                    "./foo2/barA",
+                    "",
+                    " ",
+                ),ProcessedSuggestion::new(
+                    "./foo3/barA",
+                    "",
+                    " ",
+                )],
+            );
+
+            let outcome = apply_tab_complete_to_buffer(&mut buffer, &builder, &comp_context.word_under_cursor);
+            log::info!("Outcome of applying tab complete: {:?}", &outcome);
+            assert!(matches!(outcome, TabCompleteBufferOutcome::Pending { ref final_wuc } if final_wuc.as_ref() == "./foo"));
+            assert_eq!(buffer.buffer(), "mycmd ./foo");
+        }
+
+        // #[test]
+        // fn mid_word_completion_naive_bash_default() {
+        //     cd_to_example_fs();
+        //     // Cat is setup so that run_programmable_completions in test fixtures
+        //     // returns files matching the lhs of
+        //     let mut buffer = TextBuffer::new("cat ./abc/f/baz");
+        //     buffer.move_left();
+        //     buffer.move_left();
+        //     buffer.move_left();
+        //     buffer.move_left(); // cursor is now right after f
+
+
+        //     let (builder, comp_context) = get_builder_from_buffer(&buffer).unwrap();
+        //     assert_eq!(builder.comp_type, CompType::FilenameExpansion);
+        //     assert_processed(
+        //         &builder.processed,
+        //         &[ProcessedSuggestion::new(
+        //             "./abc/foo/baz",
+        //             "",
+        //             " ",
+        //         )],
+        //     );
+
+        //     let outcome = apply_tab_complete_to_buffer(&mut buffer, &builder, &comp_context.word_under_cursor);
+        //     assert!(matches!(outcome, TabCompleteBufferOutcome::SoloAccepted));
+        //     assert_eq!(buffer.buffer(), "casdfat ./abc/foo/baz ");
+        // }
+
+
+
         // ------- finish_tab_complete (auto-accept solo) ------------------
 
         #[test]
         fn finish_tab_complete_auto_accepts_solo_suggestion() {
             cd_to_example_fs();
             let mut buffer = TextBuffer::new("mycmd bar.tx");
-            let comp_context =
-                get_completion_context(buffer.buffer(), buffer.cursor_byte_pos());
-            let wuc = comp_context.word_under_cursor.clone();
-            let builder = gen_completions_internal(&comp_context).expect("some completions");
+            let (builder, comp_context) = get_builder_from_buffer(&buffer).unwrap();
 
             assert_eq!(builder.len(), 1, "expected exactly one suggestion");
-            let outcome = apply_tab_complete_to_buffer(&mut buffer, &builder, &wuc);
+            assert_eq!(builder.comp_type, CompType::FilenameExpansion);
+
+            let outcome = apply_tab_complete_to_buffer(&mut buffer, &builder, &comp_context.word_under_cursor);
             assert!(matches!(outcome, TabCompleteBufferOutcome::SoloAccepted));
             assert_eq!(buffer.buffer(), "mycmd bar.txt ");
         }
@@ -1170,12 +1347,9 @@ mod tab_completion_tests {
             cd_to_example_braces_fs();
             // foo1, foo2 and foo3 all share the prefix "foo".
             let mut buffer = TextBuffer::new("mycmd f");
-            let comp_context =
-                get_completion_context(buffer.buffer(), buffer.cursor_byte_pos());
-            let wuc = comp_context.word_under_cursor.clone();
-            let builder = gen_completions_internal(&comp_context).expect("some completions");
+            let (builder, comp_context) = get_builder_from_buffer(&buffer).unwrap();
             assert!(builder.len() >= 2, "expected multiple suggestions, got {}", builder.len());
-            let outcome = apply_tab_complete_to_buffer(&mut buffer, &builder, &wuc);
+            let outcome = apply_tab_complete_to_buffer(&mut buffer, &builder, &comp_context.word_under_cursor);
             assert!(matches!(outcome, TabCompleteBufferOutcome::Pending { .. }));
             assert_eq!(buffer.buffer(), "mycmd foo");
         }

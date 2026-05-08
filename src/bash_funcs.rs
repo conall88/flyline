@@ -710,21 +710,67 @@ pub fn run_programmable_completions(
         word_under_cursor
     );
 
-    if command_word != "git" {
-        return Ok(ProgrammableCompleteReturn::new(
+    if command_word == "git" {
+        let candidates = test_fixtures::dummy_git_completions(full_command, word_under_cursor);
+        let completions: Vec<String> = candidates
+            .into_iter()
+            .map(|c| c.get_value().to_string_lossy().to_string())
+            .collect();
+        let mut flags = CompletionFlags::default();
+        flags.quote_type = find_quote_type(word_under_cursor);
+        Ok(ProgrammableCompleteReturn::new(completions, flags))
+    } else if command_word == "cat" {
+        // do a naive filessytem glob.
+        // bash sometimes does this if nothing is returned by the prog comp spec.
+
+        // Split word_under_cursor at the final '/'.
+        // lhs keeps the trailing slash so completions can be reassembled in the
+        // same shape the user typed.
+        let (lhs, rhs) = match word_under_cursor.rsplit_once('/') {
+            Some((left, right)) => (format!("{left}/"), right),
+            None => (String::new(), word_under_cursor),
+        };
+
+        // Expand the directory side (lhs) before filesystem lookup.
+        let expanded_lhs = if lhs.is_empty() {
+            expand_filename(".")
+        } else {
+            expand_filename(&lhs)
+        };
+
+        let mut completions = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&expanded_lhs) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str()
+                    && name.starts_with(rhs)
+                {
+                    let mut candidate = if lhs.is_empty() {
+                        name.to_string()
+                    } else {
+                        format!("{lhs}{name}")
+                    };
+
+                    if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                        candidate.push('/');
+                    }
+
+                    completions.push(candidate);
+                }
+            }
+        }
+
+        completions.sort();
+        completions.dedup();
+
+        let mut flags = CompletionFlags::default();
+        flags.quote_type = find_quote_type(word_under_cursor);
+        Ok(ProgrammableCompleteReturn::new(completions, flags))
+    } else {
+        Ok(ProgrammableCompleteReturn::new(
             Vec::new(),
             CompletionFlags::default(),
-        ));
+        ))
     }
-
-    let candidates = test_fixtures::dummy_git_completions(full_command, word_under_cursor);
-    let completions: Vec<String> = candidates
-        .into_iter()
-        .map(|c| c.get_value().to_string_lossy().to_string())
-        .collect();
-    let mut flags = CompletionFlags::default();
-    flags.quote_type = find_quote_type(word_under_cursor);
-    Ok(ProgrammableCompleteReturn::new(completions, flags))
 }
 
 #[cfg(not(test))]
