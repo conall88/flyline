@@ -45,6 +45,158 @@ use skim::fuzzy_matcher::arinae::ArinaeMatcher;
 //   if (iscompgen && iscompleting == 0 && rl_completion_found_quote == 0
 //   && rl_filename_dequoting_function) { ... }
 
+/// Result of running command-style completion (programmable bash
+/// completion or flyline's own clap-based completer) for a single
+/// completion type.
+enum CompSpecCompletionResult {
+    /// We have suggestions to return.
+    Found(ActiveSuggestionsBuilder),
+    /// No suggestions, but bash returned flags worth propagating to
+    /// subsequent completion types (e.g. quote type).
+    NoneWithFlags(bash_funcs::CompletionFlags),
+    /// No suggestions and nothing to propagate.
+    None,
+}
+
+fn run_comp_spec_completion(
+    completion_context: &tab_completion_context::CompletionContext,
+    initial_command_word: &str,
+) -> CompSpecCompletionResult {
+    let poss_alias = bash_funcs::find_alias(initial_command_word);
+    log::debug!(
+        "Checking for alias for command word '{}': {:?}",
+        initial_command_word,
+        poss_alias
+    );
+    let alias_def = poss_alias
+        .as_deref()
+        .filter(|alias| !alias.is_empty())
+        .unwrap_or(initial_command_word);
+    let alias_expanded_completion_context = completion_context.with_expanded_alias(alias_def);
+    let alias_expanded_command_word = alias_def
+        .split_whitespace()
+        .next()
+        .unwrap_or(alias_def)
+        .to_string();
+    let alias_expanded_full_command = alias_expanded_completion_context.context.as_ref();
+    let alias_expanded_cursor_byte_pos =
+        alias_expanded_completion_context.cursor_byte_pos_context_relative();
+    let alias_expanded_word_under_cursor =
+        alias_expanded_completion_context.word_under_cursor.as_ref();
+    let alias_expanded_word_under_cursor_end =
+        alias_expanded_completion_context.word_under_cursor_end_context_relative();
+
+    if alias_expanded_command_word == "flyline" {
+        // Flyline's own subcommand/flag completions are produced by
+        // clap_complete and are already escaped/finalized. Skip the
+        // bash post-processing pipeline entirely and build
+        // ProcssedSuggestions directly so descriptions (the help text
+        // attached to each candidate) are preserved as-is.
+        match complete_flyline_args(
+            alias_expanded_full_command,
+            alias_expanded_word_under_cursor,
+            alias_expanded_cursor_byte_pos,
+        ) {
+            Ok(candidates) if !candidates.is_empty() => {
+                let quote_type = bash_funcs::find_quote_type(alias_expanded_word_under_cursor);
+
+                let processed: Vec<ProcessedSuggestion> = candidates
+                    .into_iter()
+                    .filter_map(|c| {
+                        let value = c.get_value().to_string_lossy().to_string();
+                        let value = if let Some(qt) = quote_type {
+                            bash_funcs::quoting_function_rust(&value, qt, true, false)
+                        } else {
+                            value.clone()
+                        };
+                        let (value, suffix) =
+                            if let Some(stripped) = value.strip_suffix("NO_SUFFIX") {
+                                (stripped.to_string(), "")
+                            } else {
+                                (value, " ")
+                            };
+                        let (prefix, value) = if let Some(delim_pos) = value.find("PREFIX_DELIM") {
+                            let p = value[..delim_pos].to_string();
+                            let v = value[delim_pos + "PREFIX_DELIM".len()..].to_string();
+                            (p, v)
+                        } else {
+                            (String::new(), value)
+                        };
+
+                        let description = match c.get_help() {
+                            Some(h) => {
+                                let ansi_help = format!("{}", h.ansi());
+                                SuggestionDescription::Animation(
+                                    ansi_help
+                                        .split('\t')
+                                        .map(|s| ansi_string_to_spans(s))
+                                        .collect(),
+                                )
+                            }
+                            None => SuggestionDescription::Static(vec![]),
+                        };
+
+                        Some(
+                            ProcessedSuggestion::new(&value, prefix, suffix)
+                                .with_description(description),
+                        )
+                    })
+                    .collect();
+
+                if processed.is_empty() {
+                    return CompSpecCompletionResult::None;
+                }
+
+                let mut builder = ActiveSuggestionsBuilder::new();
+                builder.extend_processed(processed);
+                CompSpecCompletionResult::Found(builder)
+            }
+            Ok(_) => {
+                log::debug!(
+                    "No flyline completions found for command '{}'",
+                    alias_expanded_full_command
+                );
+                CompSpecCompletionResult::None
+            }
+            Err(e) => {
+                log::error!("Error generating flyline completions: {}", e);
+                CompSpecCompletionResult::None
+            }
+        }
+    } else {
+        let poss_completions = bash_funcs::run_programmable_completions(
+            alias_expanded_full_command,
+            &alias_expanded_command_word,
+            alias_expanded_word_under_cursor,
+            alias_expanded_cursor_byte_pos,
+            alias_expanded_word_under_cursor_end,
+        );
+
+        match poss_completions {
+            Ok(comp_result) if !comp_result.completions.is_empty() => {
+                log::debug!(
+                    "Programmable completion results for command: {}",
+                    alias_expanded_full_command
+                );
+                log::debug!("Completions: {:#?}", comp_result);
+                let flags = comp_result.flags;
+                let mut builder = ActiveSuggestionsBuilder::new();
+                builder.extend_unprocessed(comp_result.completions.into_iter().map(move |sug| {
+                    UnprocessedSuggestion {
+                        raw_text: sug,
+                        full_path: None,
+                        flags,
+                        word_under_cursor: alias_expanded_word_under_cursor.to_string(),
+                    }
+                }));
+                CompSpecCompletionResult::Found(builder)
+            }
+            Ok(comp_result) => CompSpecCompletionResult::NoneWithFlags(comp_result.flags),
+            _ => CompSpecCompletionResult::None,
+        }
+    }
+}
+
 pub(crate) fn gen_completions_internal(
     completion_context: &tab_completion_context::CompletionContext,
 ) -> Option<ActiveSuggestionsBuilder> {
@@ -94,137 +246,85 @@ pub(crate) fn gen_completions_internal(
                 // https://www.reddit.com/r/bash/comments/eqwitd/programmable_completion_on_expanded_aliases_not/
                 // Since aliases are the highest priority in command word resolution,
                 // If it is an alias, lets expand it here for better completion results.
-                let poss_alias = bash_funcs::find_alias(initial_command_word);
-                log::debug!(
-                    "Checking for alias for command word '{}': {:?}",
-                    initial_command_word,
-                    poss_alias
-                );
-                let alias_def = poss_alias
-                    .as_deref()
-                    .filter(|alias| !alias.is_empty())
-                    .unwrap_or(initial_command_word);
-                let alias_expanded_completion_context =
-                    completion_context.with_expanded_alias(alias_def);
-                let alias_expanded_command_word = alias_def
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or(alias_def)
-                    .to_string();
-                let alias_expanded_full_command =
-                    alias_expanded_completion_context.context.as_ref();
-                let alias_expanded_cursor_byte_pos =
-                    alias_expanded_completion_context.cursor_byte_pos_context_relative();
-                let alias_expanded_word_under_cursor =
-                    alias_expanded_completion_context.word_under_cursor.as_ref();
-                let alias_expanded_word_under_cursor_end =
-                    alias_expanded_completion_context.word_under_cursor_end_context_relative();
-
-                if alias_expanded_command_word == "flyline" {
-                    // Flyline's own subcommand/flag completions are produced by
-                    // clap_complete and are already escaped/finalized. Skip the
-                    // bash post-processing pipeline entirely and build
-                    // ProcssedSuggestions directly so descriptions (the help text
-                    // attached to each candidate) are preserved as-is.
-                    match complete_flyline_args(
-                        alias_expanded_full_command,
-                        alias_expanded_word_under_cursor,
-                        alias_expanded_cursor_byte_pos,
-                    ) {
-                        Ok(candidates) if !candidates.is_empty() => {
-                            let quote_type =
-                                bash_funcs::find_quote_type(word_under_cursor.as_ref());
-
-                            let mut builder = ActiveSuggestionsBuilder::new();
-                            builder.extend_processed(candidates.into_iter().map(|c| {
-                                let value = c.get_value().to_string_lossy().to_string();
-                                let value = if let Some(qt) = quote_type {
-                                    bash_funcs::quoting_function_rust(&value, qt, true, false)
-                                } else {
-                                    value.clone()
-                                };
-
-                                let (value, suffix) =
-                                    if let Some(stripped) = value.strip_suffix("NO_SUFFIX") {
-                                        (stripped.to_string(), "")
-                                    } else {
-                                        (value, " ")
-                                    };
-                                let (prefix, value) = if let Some(delim_pos) =
-                                    value.find("PREFIX_DELIM")
-                                {
-                                    let p = value[..delim_pos].to_string();
-                                    let v = value[delim_pos + "PREFIX_DELIM".len()..].to_string();
-                                    (p, v)
-                                } else {
-                                    (String::new(), value)
-                                };
-
-                                let description = {
-                                    match c.get_help() {
-                                        Some(h) => {
-                                            let ansi_help = format!("{}", h.ansi());
-                                            SuggestionDescription::Animation(
-                                                ansi_help
-                                                    .split('\t')
-                                                    .map(|s| ansi_string_to_spans(s))
-                                                    .collect(),
-                                            )
-                                        }
-                                        None => SuggestionDescription::Static(vec![]),
-                                    }
-                                };
-
-                                ProcessedSuggestion::new(&value, prefix, suffix)
-                                    .with_description(description)
-                            }));
-                            return Some(builder);
-                        }
-                        Ok(_) => {
-                            log::debug!(
-                                "No flyline completions found for command '{}'",
-                                alias_expanded_full_command
-                            );
-                        }
-                        Err(e) => {
-                            log::error!("Error generating flyline completions: {}", e);
-                        }
+                match run_comp_spec_completion(completion_context, initial_command_word) {
+                    CompSpecCompletionResult::Found(builder) => {
+                        return Some(builder);
                     }
+                    CompSpecCompletionResult::NoneWithFlags(flags) => {
+                        // I am not checking if the user wants more completions (i.e. readline_default_fallback_desired)
+                        // Always try to produce secondary completions
+                        comp_res_flags = flags;
+                    }
+                    CompSpecCompletionResult::None => {}
+                }
+            }
+
+            tab_completion_context::CompType::FuzzyCommandComp {
+                command_word: initial_command_word,
+            } => {
+                let original_wuc = word_under_cursor.as_ref();
+                log::debug!("CompType::FuzzyCommandComp for: {}", original_wuc);
+
+                let new_wuc: String = if original_wuc.starts_with("--") {
+                    original_wuc.chars().take(2).collect()
+                } else if original_wuc.len() <= 1 {
+                    continue;
                 } else {
-                    let poss_completions = bash_funcs::run_programmable_completions(
-                        alias_expanded_full_command,
-                        &alias_expanded_command_word,
-                        alias_expanded_word_under_cursor,
-                        alias_expanded_cursor_byte_pos,
-                        alias_expanded_word_under_cursor_end,
-                    );
+                    original_wuc.chars().take(1).collect()
+                };
 
-                    match poss_completions {
-                        Ok(comp_result) if !comp_result.completions.is_empty() => {
-                            log::debug!(
-                                "Programmable completion results for command: {}",
-                                alias_expanded_full_command
-                            );
-                            log::debug!("Completions: {:#?}", comp_result);
+                let fuzzy_completion_context = completion_context.with_wuc_replaced(&new_wuc);
 
-                            let mut builder = ActiveSuggestionsBuilder::new();
-                            builder.extend_unprocessed(comp_result.completions.into_iter().map(
-                                |sug| UnprocessedSuggestion {
-                                    raw_text: sug,
-                                    full_path: None,
-                                    flags: comp_result.flags,
-                                    word_under_cursor: word_under_cursor.as_ref().to_string(),
-                                },
-                            ));
-                            return Some(builder);
-                        }
-                        Ok(comp_result) => {
-                            // I am not checking if the user wants more completions (i.e. readline_default_fallback_desired)
-                            // Always try to produce secondary completions
-                            comp_res_flags = comp_result.flags;
-                        }
-                        _ => {}
+                match run_comp_spec_completion(&fuzzy_completion_context, initial_command_word) {
+                    CompSpecCompletionResult::Found(mut builder) => {
+                        let matcher = ArinaeMatcher::new(skim::CaseMatching::Smart, true);
+                        let pattern = original_wuc.strip_prefix(&new_wuc).unwrap_or(original_wuc);
+
+                        builder.processed = builder
+                            .processed
+                            .into_iter()
+                            .filter_map(|sug| {
+                                let match_text = &sug.s.strip_prefix(&new_wuc).unwrap_or(&sug.s);
+                                content_utils::fuzzy_match_with_threshold(
+                                    &matcher,
+                                    match_text,
+                                    pattern,
+                                    content_utils::FuzzyMatchThreshold::High,
+                                )
+                                .inspect(|score| {
+                                    log::debug!("Fuzzy match score for '{}': {}", match_text, score)
+                                })
+                                .map(|_score| sug)
+                            })
+                            .collect();
+
+                        builder.unprocessed = builder
+                            .unprocessed
+                            .into_iter()
+                            .filter_map(|sug| {
+                                let match_text = &sug
+                                    .match_text()
+                                    .strip_prefix(&new_wuc)
+                                    .unwrap_or(&sug.match_text());
+                                content_utils::fuzzy_match_with_threshold(
+                                    &matcher,
+                                    match_text,
+                                    pattern,
+                                    content_utils::FuzzyMatchThreshold::High,
+                                )
+                                .inspect(|score| {
+                                    log::debug!("Fuzzy match score for '{}': {}", match_text, score)
+                                })
+                                .map(|_score| sug)
+                            })
+                            .collect();
+                        builder = builder.with_auto_accept_if_solo(false);
+                        return Some(builder);
                     }
+                    CompSpecCompletionResult::NoneWithFlags(flags) => {
+                        comp_res_flags = flags;
+                    }
+                    CompSpecCompletionResult::None => {}
                 }
             }
 
@@ -455,8 +555,12 @@ fn tab_complete_fuzzy_first_word(command: &str) -> ActiveSuggestionsBuilder {
     let mut seen: HashSet<String> = HashSet::new();
     for poss_completion in bash_funcs::get_possible_command_words() {
         if seen.insert(poss_completion.clone())
-            && let Some(score) =
-                content_utils::fuzzy_match_with_threshold(&matcher, &poss_completion, command)
+            && let Some(score) = content_utils::fuzzy_match_with_threshold(
+                &matcher,
+                &poss_completion,
+                command,
+                content_utils::FuzzyMatchThreshold::High,
+            )
         {
             scored.push((score, poss_completion));
         }
@@ -610,8 +714,13 @@ fn tab_complete_fuzzy_filename(
             // directory prefix doesn't inflate the score.
             let match_text = sug.match_text();
             let filename = match_text.rsplit('/').next().unwrap_or(match_text);
-            content_utils::fuzzy_match_with_threshold(&matcher, filename, &dequoted_fragment)
-                .map(|score| (score, sug))
+            content_utils::fuzzy_match_with_threshold(
+                &matcher,
+                filename,
+                &dequoted_fragment,
+                content_utils::FuzzyMatchThreshold::Medium,
+            )
+            .map(|score| (score, sug))
         })
         .collect();
 
