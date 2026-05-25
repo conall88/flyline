@@ -17,11 +17,14 @@ The source code is the source of truth. Specifically verify:
 
 Fix any inconsistencies you find by editing the documentation files directly.
 Do not modify any Rust source code — only update documentation (README.md files, doc comments, and example scripts).
-If everything is already consistent, make no changes.
+
+Update this line with the last time you ran: never.
+If everything is already consistent, make no changes apart from this file.
 There might not be any changes to make since you have run on previous events.
+You should focus on the commits made since the last time you ran.
 
 Find any typos or grammatical errors in the documentation and fix those as well.
 
-After checking, write a brief summary of all changes you made (or confirm no changes were needed) to a file called copilot_summary.md.
+After checking, write a brief summary of all changes you made (or confirm no changes were needed) when you make the PR.
 
 Ignore lines that are marked with NO_FMT.
