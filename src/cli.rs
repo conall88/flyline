@@ -534,6 +534,12 @@ enum Commands {
         /// Run execution unsandboxed (bypass bubblewrap/bwrap sandboxing).
         #[arg(long)]
         no_sandbox: bool,
+        /// Timeout in milliseconds for running commands.
+        #[arg(long, default_value_t = 15000)]
+        timeout_ms: u64,
+        /// Log level to output to stderr (off, error, warn, info, debug, trace).
+        #[arg(long, default_value = "error")]
+        log_level: String,
     },
 }
 
@@ -1204,11 +1210,26 @@ impl Flyline {
                         output,
                         strategy,
                         no_sandbox,
+                        timeout_ms,
+                        log_level,
                     }) => {
                         let prev_sigchld = unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
 
+                        let parsed_level = match log_level.to_lowercase().as_str() {
+                            "off" => Some(log::LevelFilter::Off),
+                            "error" => Some(log::LevelFilter::Error),
+                            "warn" => Some(log::LevelFilter::Warn),
+                            "info" => Some(log::LevelFilter::Info),
+                            "debug" => Some(log::LevelFilter::Debug),
+                            "trace" => Some(log::LevelFilter::Trace),
+                            _ => None,
+                        };
+                        if let Some(level) = parsed_level {
+                            log::set_max_level(level);
+                        }
+
                         let result =
-                            generate_completion_output(&command, output, strategy, !no_sandbox);
+                            generate_completion_output(&command, output, strategy, !no_sandbox, timeout_ms);
 
                         unsafe { libc::signal(libc::SIGCHLD, prev_sigchld) };
 
