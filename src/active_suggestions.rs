@@ -157,6 +157,7 @@ pub struct ProcessedSuggestion {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SuggestionFormatted {
     pub suggestion_idx: usize,
+    pub filtered_idx: usize,
     /// Visual width used for column sizing. Includes the description separator and the
     /// widest description frame so that the column does not resize during animation.
     pub display_width: usize,
@@ -187,6 +188,7 @@ impl SuggestionFormatted {
     pub fn new(
         suggestion: &ProcessedSuggestion,
         suggestion_idx: usize,
+        filtered_idx: usize,
         matching_indices: Vec<usize>,
         palette: &Palette,
         frame_index: usize,
@@ -222,6 +224,7 @@ impl SuggestionFormatted {
 
         SuggestionFormatted {
             suggestion_idx,
+            filtered_idx,
             display_width,
             spans: main_spans,
             description_frame,
@@ -405,11 +408,11 @@ mod description_tests {
         );
         let palette = crate::palette::Palette::default();
 
-        let f0 = SuggestionFormatted::new(&sug, 0, vec![], &palette, 0);
-        let f1 = SuggestionFormatted::new(&sug, 0, vec![], &palette, 1);
-        let f2 = SuggestionFormatted::new(&sug, 0, vec![], &palette, 2);
+        let f0 = SuggestionFormatted::new(&sug, 0, 0, vec![], &palette, 0);
+        let f1 = SuggestionFormatted::new(&sug, 0, 0, vec![], &palette, 1);
+        let f2 = SuggestionFormatted::new(&sug, 0, 0, vec![], &palette, 2);
         // Frame 3 wraps back to frame 0.
-        let f3 = SuggestionFormatted::new(&sug, 0, vec![], &palette, 3);
+        let f3 = SuggestionFormatted::new(&sug, 0, 0, vec![], &palette, 3);
 
         assert_eq!(f0.description_frame, vec![Span::raw("a")]);
         assert_eq!(f1.description_frame, vec![Span::raw("b")]);
@@ -426,8 +429,8 @@ mod description_tests {
             ]),
         );
         let palette = crate::palette::Palette::default();
-        let fw0 = SuggestionFormatted::new(&sug, 0, vec![], &palette, 0).display_width;
-        let fw1 = SuggestionFormatted::new(&sug, 0, vec![], &palette, 1).display_width;
+        let fw0 = SuggestionFormatted::new(&sug, 0, 0, vec![], &palette, 0).display_width;
+        let fw1 = SuggestionFormatted::new(&sug, 0, 0, vec![], &palette, 1).display_width;
         // display_width must not change between frames.
         assert_eq!(fw0, fw1);
         // display_width = "abc".len() + separator(2) + max("short", "a much longer description").len()
@@ -439,7 +442,7 @@ mod description_tests {
     fn no_description_display_width_equals_text_width() {
         let sug = ProcessedSuggestion::new("hello", "", "");
         let palette = crate::palette::Palette::default();
-        let fw = SuggestionFormatted::new(&sug, 0, vec![], &palette, 0).display_width;
+        let fw = SuggestionFormatted::new(&sug, 0, 0, vec![], &palette, 0).display_width;
         assert_eq!(fw, "hello".len());
     }
 
@@ -1134,13 +1137,13 @@ impl ActiveSuggestions {
     }
 
     /// Set the selected position from a flat (1-D) suggestion index.
-    pub fn set_selected_by_idx(&mut self, idx: usize) {
+    pub fn set_selected_by_idx(&mut self, filtered_idx: usize) {
         if self.last_num_rows_per_col == 0 {
-            self.selected_coord = Some((0, idx));
+            self.selected_coord = Some((0, filtered_idx));
         } else {
             self.selected_coord = Some((
-                idx / self.last_num_rows_per_col,
-                idx % self.last_num_rows_per_col,
+                filtered_idx / self.last_num_rows_per_col,
+                filtered_idx % self.last_num_rows_per_col,
             ));
         }
         self.clamp_selection();
@@ -1368,6 +1371,7 @@ impl ActiveSuggestions {
                     let formatted = SuggestionFormatted::new(
                         suggestion,
                         fi.suggestion_idx,
+                        filtered_idx,
                         fi.matching_indices.clone(),
                         palette,
                         frame_index,
@@ -1494,6 +1498,7 @@ impl ActiveSuggestions {
                 SuggestionFormatted::new(
                     suggestion,
                     fi.suggestion_idx,
+                    filtered_idx,
                     fi.matching_indices.clone(),
                     palette,
                     frame_index,

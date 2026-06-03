@@ -65,7 +65,6 @@ impl DrawnContent {
                     | Tag::PromptCopyBufferWidget
                     | Tag::Clipboard(_)
                     | Tag::Ps1PromptCwdWidget(_)
-                    | Tag::TabCompletionSource
                     | Tag::TabCompletionScrollBar { .. }
             )
         }) {
@@ -1048,7 +1047,7 @@ impl<'a> App<'a> {
 
                         let formatted_suggestion = formatted.render(col.width, *is_selected);
 
-                        let tag = Tag::Suggestion(formatted.suggestion_idx);
+                        let tag = Tag::Suggestion(formatted.filtered_idx);
                         for span in formatted_suggestion {
                             content.write_tagged_span(&TaggedSpan::new(span, tag));
                         }
@@ -1101,7 +1100,7 @@ impl<'a> App<'a> {
                 ),
                 settings.colour_palette.secondary_text(),
             ),
-            Tag::TabCompletionSource,
+            Tag::TabSuggestion,
         ));
     }
 
@@ -1222,7 +1221,7 @@ impl<'a> App<'a> {
             ),
             TaggedSpan::new(
                 Span::styled(source_str, settings.colour_palette.secondary_text()),
-                Tag::TabCompletionSource,
+                Tag::TabSuggestion,
             ),
         ]);
 
@@ -1235,7 +1234,6 @@ impl<'a> App<'a> {
             Some(status_line),
         );
 
-        let selected_1d = active_suggestions.current_1d_index();
         let window_range = active_suggestions.row_window_to_show.get_window_range();
         let mut selected_grid_row: Option<u16> = None;
 
@@ -1243,12 +1241,12 @@ impl<'a> App<'a> {
             let item_row = y + 1 + i as u16;
             content.move_cursor_to(item_row, x + 1);
 
-            let is_selected = selected_1d == Some(window_range.start + i);
+            let is_selected = active_suggestions.current_1d_index() == Some(item.filtered_idx);
             if is_selected {
                 selected_grid_row = Some(i as u16);
             }
             let spans = item.render(inner_width, is_selected);
-            let tag = Tag::Suggestion(item.suggestion_idx);
+            let tag = Tag::Suggestion(item.filtered_idx);
 
             for span in spans {
                 content.write_tagged_span_area(&TaggedSpan::new(span, tag), full_inner_area);
@@ -1263,10 +1261,6 @@ impl<'a> App<'a> {
             num_rows_visible,
             window_range.start,
             settings.colour_palette.secondary_text(),
-            Tag::TabCompletionScrollBar {
-                start_y: y + 1,
-                height: num_rows_visible as u16,
-            },
         );
 
         if let Some(sel_row) = selected_grid_row {

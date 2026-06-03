@@ -184,8 +184,10 @@ pub enum Tag {
     HistoryResult(usize),
     Tooltip,
     AiResult(usize),
-    TabCompletionSource,
-    TabCompletionScrollBar { start_y: u16, height: u16 },
+    TabCompletionScrollBar {
+        cell_height: usize,
+        total_height: usize,
+    },
     TutorialPrev,
     TutorialNext,
     Tutorial,
@@ -962,7 +964,6 @@ impl Contents {
         visible: usize,
         start: usize,
         style: ratatui::style::Style,
-        tag: Tag,
     ) {
         if length == 0 || total == 0 || visible >= total {
             return;
@@ -993,7 +994,10 @@ impl Contents {
             {
                 tagged_cell.cell.reset();
                 tagged_cell.cell.set_symbol(symbol).set_style(style);
-                tagged_cell.tag = tag;
+                tagged_cell.tag = Tag::TabCompletionScrollBar {
+                    cell_height: i,
+                    total_height: length as usize,
+                };
             }
         }
     }

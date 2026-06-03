@@ -633,12 +633,14 @@ fn detect_and_convert_inline_descriptions(completions: &mut Vec<String>, flags: 
     if detected {
         for s in completions.iter_mut() {
             if let Some((value, description, _)) = analyze_candidate(s) {
-                let description =
-                    if let Some(stripped) = description.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
-                        stripped
-                    } else {
-                        description
-                    };
+                let description = if let Some(stripped) = description
+                    .strip_prefix('(')
+                    .and_then(|s| s.strip_suffix(')'))
+                {
+                    stripped
+                } else {
+                    description
+                };
                 *s = format!("{}\t{}", value, description);
             }
         }

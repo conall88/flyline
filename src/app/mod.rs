@@ -717,10 +717,6 @@ impl<'a> App<'a> {
     fn on_mouse(&mut self, mouse: MouseEvent) -> bool {
         log::trace!("Mouse event: {:?}", mouse);
 
-        let old_mouse_button_down = self.mouse_state.is_left_button_down();
-        let old_mouse_over_cell = self.last_mouse_over_cell;
-        let old_tooltip = self.tooltip.clone();
-
         // Track whether the left mouse button is currently being held down so
         // interactive cells (clipboard cells, buttons) can render a "depressed"
         // state while the user is pressing on them.
@@ -777,6 +773,7 @@ impl<'a> App<'a> {
             Some((tag @ Tag::Suggestion(idx), true)) => {
                 self.last_mouse_over_cell = Some(tag);
                 if let ContentMode::TabCompletion(active_suggestions) = &mut self.content_mode {
+                    log::debug!("Setting selected by idx: {}", idx);
                     active_suggestions.set_selected_by_idx(idx);
                 }
             }
@@ -818,16 +815,9 @@ impl<'a> App<'a> {
             Some((tag @ Tag::Ps1PromptCwdWidget(_), _)) => {
                 self.last_mouse_over_cell = Some(tag);
             }
-            // TODO: These wont be shown
-            Some((tag @ Tag::TabCompletionSource, true)) => {
-                self.last_mouse_over_cell = Some(tag);
-                if let ContentMode::TabCompletion(ref active_suggestions) = self.content_mode {
-                    self.tooltip = Some(active_suggestions.comp_type.description().into_owned());
-                }
-            }
-            Some((tag @ Tag::TabCompletionScrollBar { .. }, true)) => {
-                self.last_mouse_over_cell = Some(tag);
-            }
+            // Some((tag @ Tag::TabCompletionScrollBar { .. }, true)) => {
+            //     self.last_mouse_over_cell = Some(tag);
+            // }
             _ => {
                 self.last_mouse_over_cell = None;
                 self.tooltip = None;
@@ -1027,15 +1017,16 @@ impl<'a> App<'a> {
                     }
                 }
             }
-            Some(Tag::TabCompletionScrollBar { start_y, height }) => {
+            Some(Tag::TabCompletionScrollBar {
+                cell_height,
+                total_height,
+            }) => {
                 if matches!(
                     mouse.kind,
                     MouseEventKind::Down(event::MouseButton::Left) | MouseEventKind::Drag(_)
                 ) {
                     if let ContentMode::TabCompletion(active_suggestions) = &mut self.content_mode {
-                        let relative_y = mouse.row as f64 - start_y as f64;
-                        let relative_pos =
-                            (relative_y / (height.saturating_sub(1)).max(1) as f64).clamp(0.0, 1.0);
+                        let relative_pos = cell_height as f64 / total_height as f64;
                         active_suggestions.set_selected_by_scrollbar_pos(relative_pos);
                         update_buffer = true;
                     }
@@ -1044,15 +1035,11 @@ impl<'a> App<'a> {
             _ => {}
         }
 
-        let something_changed = self.last_mouse_over_cell != old_mouse_over_cell
-            || self.tooltip != old_tooltip
-            || self.mouse_state.is_left_button_down() != old_mouse_button_down;
-
         if update_buffer {
             self.on_possible_buffer_change();
             true
         } else {
-            something_changed
+            false
         }
     }
 
