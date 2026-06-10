@@ -259,8 +259,9 @@ impl FuzzyHistorySource {
 /// Guard that owns the tab-completion background process and the result channel.
 /// Killing the process (on drop) ensures it does not outlive the app.
 pub(crate) struct TabCompletionHandle {
-    receiver: std::sync::mpsc::Receiver<Option<(ActiveSuggestionsBuilder, std::time::Duration)>>,
-    pid: Option<libc::pid_t>,
+    pub(crate) receiver:
+        std::sync::mpsc::Receiver<Option<(ActiveSuggestionsBuilder, std::time::Duration)>>,
+    pub(crate) shutdown_signal: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for TabCompletionHandle {
@@ -271,14 +272,8 @@ impl std::fmt::Debug for TabCompletionHandle {
 
 impl Drop for TabCompletionHandle {
     fn drop(&mut self) {
-        if let Some(pid) = self.pid.take() {
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-                let mut status = 0;
-                libc::waitpid(pid, &mut status, 0);
-                log::info!("Tab completion process (pid {}) reaped", pid);
-            }
-        }
+        self.shutdown_signal
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -723,6 +718,11 @@ impl<'a> App<'a> {
             .and_then(|drawn_contents| drawn_contents.get_tagged_cell(mouse.column, mouse.row))
             .map(|(tag, _)| tag);
 
+        let active_drag_tag = match mouse.kind {
+            MouseEventKind::Down(event::MouseButton::Left) => clicked_tag,
+            _ => self.mouse_state.drag_start_tag,
+        };
+
         match mouse.kind {
             MouseEventKind::Down(event::MouseButton::Left) => {
                 self.mouse_state.set_left_button_down();
@@ -768,13 +768,13 @@ impl<'a> App<'a> {
             }
         }
 
-        let mut update_buffer = false;
         if let Some(Tag::TabCompletionScrollBar {
             max_cell_height,
             y_start,
             ..
-        }) = self.mouse_state.drag_start_tag
+        }) = active_drag_tag
         {
+            let mut redraw = false;
             if matches!(
                 mouse.kind,
                 MouseEventKind::Down(event::MouseButton::Left)
@@ -795,11 +795,14 @@ impl<'a> App<'a> {
                     if let ContentMode::TabCompletion(active_suggestions) = &mut self.content_mode {
                         active_suggestions
                             .set_selected_by_scrollbar_pos(cell_height, max_cell_height);
-                        update_buffer = true;
+                        redraw = true;
                     }
                 }
             }
+            return redraw;
         }
+
+        let mut update_buffer = false;
 
         let mut cursor_directly_on_cell = true;
 
@@ -951,7 +954,8 @@ impl<'a> App<'a> {
             }
             Some(Tag::Command(byte_pos))
                 if self.settings.select_with_mouse
-                    && matches!(mouse.kind, MouseEventKind::Drag(_)) =>
+                    && matches!(mouse.kind, MouseEventKind::Drag(_))
+                    && matches!(active_drag_tag, Some(Tag::Command(_))) =>
             {
                 match (
                     self.mouse_state.get_click_count(),
@@ -1020,12 +1024,11 @@ impl<'a> App<'a> {
                         crossterm::event::KeyEvent::new(KeyCode::Null, KeyModifiers::NONE),
                     );
                     update_buffer = true;
-                } else if matches!(
-                    mouse.kind,
-                    MouseEventKind::Down(_) | MouseEventKind::Drag(_)
-                ) {
+                } else if matches!(mouse.kind, MouseEventKind::Down(_)) {
                     self.content_mode = ContentMode::PromptDirSelect(idx);
                     return true;
+                } else if matches!(mouse.kind, MouseEventKind::Drag(_)) {
+                    self.content_mode = ContentMode::PromptDirSelect(idx);
                 }
             }
             Some(Tag::Clipboard(clipboard_type)) => {
@@ -1054,6 +1057,13 @@ impl<'a> App<'a> {
                 }
             }
             _ => {}
+        }
+
+        if mouse.kind == MouseEventKind::Moved || matches!(mouse.kind, MouseEventKind::Drag(_)) {
+            if update_buffer {
+                self.on_possible_buffer_change();
+            }
+            return false;
         }
 
         if update_buffer {
@@ -1391,7 +1401,10 @@ impl<'a> App<'a> {
                             .modifiers
                             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
 
-                        (c == '/' || (c == '-' && new_wuc.s.chars().all(|ch| ch == '-')))
+                        (c == '/'
+                            || c == '$'
+                            || c == '~'
+                            || (c == '-' && new_wuc.s.chars().all(|ch| ch == '-')))
                             && mods_satisfied
                     } else {
                         false
