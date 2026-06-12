@@ -7,7 +7,7 @@ on:
 
 concurrency:
   group: update-settings-docs
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   update-settings-docs:
