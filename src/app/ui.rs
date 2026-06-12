@@ -384,7 +384,7 @@ impl<'a> App<'a> {
                 if !self.mouse_state.is_enabled() {
                     let red = Style::default().fg(Color::Red).slow_blink();
                     let escape_hint = TaggedLine::from(vec![TaggedSpan::new(
-                        Span::styled("Press Escape  to re-enable mouse mode.", red),
+                        Span::styled("Press Escape to re-enable mouse mode.", red),
                         Tag::Tutorial,
                     )]);
                     for tagged_span in &escape_hint.spans {

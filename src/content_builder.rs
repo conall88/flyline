@@ -141,6 +141,7 @@ pub enum ClipboardTypes {
     TutorialClickExample,
     TutorialRP1,
     TutorialMouseMode,
+    TutorialAutoSuggest,
     TutorialRecommendedSettings,
     TutorialCursor0,
     TutorialCursor1,

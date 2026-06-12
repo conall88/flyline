@@ -90,11 +90,12 @@ pub enum TutorialStep {
     TutorialsTutorial,
     RecommendedSettings,
     MouseMode,
-    AgentMode,
     FuzzyHistorySearch,
-    Autocompletions,
+    AutoSuggestions,
+    TabSuggestions,
     AutoClosing,
     FineGrainDeletion,
+    AgentMode,
     ThemeColours,
     CursorStyleEffects,
     Keybindings,
@@ -386,6 +387,26 @@ pub fn generate_tutorial_text(
                 ]));
             }
         }
+        TutorialStep::AutoSuggestions => {
+            lines.push(tl(Span::styled("Auto Suggestions", heading_style)));
+            lines.push(empty());
+            lines.push(tl(Span::styled(
+                "As you type, flyline shows Intellisense style auto-suggestions based on Bash tab completions.",
+                text_style,
+            )));
+            lines.push(empty());
+            lines.push(tl(Span::styled(
+                "You can disable these auto-suggestions by running:",
+                text_style,
+            )));
+            lines.push(TaggedLine::from(vec![
+                TaggedSpan::new(Span::styled("    ", text_style), Tag::Tutorial),
+                ts_copiable(
+                    "flyline suggestions --auto-suggest false".to_string(),
+                    ClipboardTypes::TutorialAutoSuggest,
+                ),
+            ]));
+        }
         TutorialStep::FuzzyHistorySearch => {
             lines.push(tl(Span::styled("Fuzzy History Search", heading_style)));
             lines.push(empty());
@@ -462,8 +483,8 @@ pub fn generate_tutorial_text(
                 ),
             ]));
         }
-        TutorialStep::Autocompletions => {
-            lines.push(tl(Span::styled("Fuzzy Autocompletions", heading_style)));
+        TutorialStep::TabSuggestions => {
+            lines.push(tl(Span::styled("Fuzzy Completions", heading_style)));
             lines.push(empty());
             lines.push(TaggedLine::from(vec![
                 TaggedSpan::new(Span::styled("Type ", text_style), Tag::Tutorial),
@@ -473,7 +494,7 @@ pub fn generate_tutorial_text(
                 ),
                 ts_text(" and press "),
                 ts_key("Tab"),
-                ts_text(" to trigger autocompletions. If nothing comes up, first set normal Bash completions ("),
+                ts_text(" to trigger completions. If nothing comes up, first set normal Bash completions ("),
                 ts_copiable(
                     "https://github.com/scop/bash-completion".to_string(),
                     ClipboardTypes::TutorialBashCompletion,
