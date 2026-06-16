@@ -165,12 +165,13 @@ pub struct SuggestionFormatted {
     /// Pre-processed description spans for the current animation frame (empty if there is
     /// no description). Truncation is decided at render time according to the
     /// available column width.
-    description_frame: Vec<Span<'static>>,
+    pub(crate) description_frame: Vec<Span<'static>>,
     /// Style applied as a base when rendering description spans (patched by each
     /// span's own style so that ANSI-encoded colours take precedence).
-    description_style: Style,
+    pub(crate) description_style: Style,
     /// Width of the current description frame (excluding the separator).
-    description_frame_width: usize,
+    pub(crate) description_frame_width: usize,
+    pub(crate) base_style: Style,
 }
 
 impl SuggestionFormatted {
@@ -230,6 +231,7 @@ impl SuggestionFormatted {
             description_frame,
             description_style,
             description_frame_width,
+            base_style,
         }
     }
 
@@ -289,7 +291,13 @@ impl SuggestionFormatted {
         if is_selected {
             spans = spans
                 .into_iter()
-                .map(|span| Span::styled(span.content, Palette::convert_to_highlighted(span.style)))
+                .map(|span| {
+                    let mut style = span.style;
+                    if style != self.base_style {
+                        style = style.add_modifier(Modifier::BOLD);
+                    }
+                    Span::styled(span.content, Palette::convert_to_highlighted(style))
+                })
                 .collect();
         }
 
@@ -305,17 +313,63 @@ impl SuggestionFormatted {
             " ".repeat(col_width.saturating_sub(rendered_total)),
         ));
 
+        let desc_style = if is_selected {
+            Style::default()
+        } else {
+            self.description_style
+        };
+
         // Append description if there is space for it.
         if desc_render_width > 0 {
             spans.push(Span::raw(Self::DESCRIPTION_SEPARATOR));
-            let truncated = take_prefix_of_spans(&self.description_frame, desc_render_width);
-            spans.extend(
-                truncated.into_iter().map(|span| {
-                    Span::styled(span.content, self.description_style.patch(span.style))
-                }),
-            );
+            if desc_render_width < self.description_frame_width {
+                let text_width = desc_render_width.saturating_sub(1);
+                let truncated = take_prefix_of_spans(&self.description_frame, text_width);
+                spans.extend(
+                    truncated
+                        .into_iter()
+                        .map(|span| Span::styled(span.content, desc_style.patch(span.style))),
+                );
+                spans.push(Span::styled("…", desc_style));
+            } else {
+                let truncated = take_prefix_of_spans(&self.description_frame, desc_render_width);
+                spans.extend(
+                    truncated
+                        .into_iter()
+                        .map(|span| Span::styled(span.content, desc_style.patch(span.style))),
+                );
+            }
         }
 
+        spans
+    }
+
+    /// Render this suggestion without truncation (e.g. for wrapping).
+    pub fn render_untruncated(&self, is_selected: bool) -> Vec<Span<'static>> {
+        let mut spans = self.spans.clone();
+        if is_selected {
+            for span in &mut spans {
+                if span.style != self.base_style {
+                    span.style = span.style.add_modifier(Modifier::BOLD);
+                }
+                span.style = Palette::convert_to_highlighted(span.style);
+            }
+        }
+        if !self.description_frame.is_empty() {
+            spans.push(Span::raw(Self::DESCRIPTION_SEPARATOR));
+            let desc_style = if is_selected {
+                Style::default()
+            } else {
+                self.description_style
+            };
+            spans.extend(self.description_frame.iter().map(|span| {
+                let mut s = Span::styled(span.content.clone(), desc_style.patch(span.style));
+                if is_selected {
+                    s.style = Palette::convert_to_highlighted(s.style);
+                }
+                s
+            }));
+        }
         spans
     }
 }

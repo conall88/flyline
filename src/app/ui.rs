@@ -1359,15 +1359,12 @@ impl<'a> App<'a> {
         }
 
         let grid_start_row = content.cursor_position().row;
-        let max_rows = settings.num_suggestion_rows.max(2);
 
-        let target_sug_height = max_rows.saturating_sub(3).max(2);
-        let mut num_rows_visible = (rows_left_before_end_of_screen as usize)
-            .saturating_sub(3)
-            .clamp(2, target_sug_height as usize)
-            .min(active_suggestions.filtered_suggestions_len());
+        let max_inner_height = 5
+            .min(rows_left_before_end_of_screen.saturating_sub(2) as usize)
+            .max(1);
 
-        num_rows_visible = num_rows_visible.max(1);
+        let num_rows_visible = max_inner_height.min(active_suggestions.filtered_suggestions_len());
 
         let items = active_suggestions.into_list(num_rows_visible, &settings.colour_palette);
         let num_rows_visible = items.len();
@@ -1427,22 +1424,161 @@ impl<'a> App<'a> {
         let max_x = term_width.saturating_sub(box_width);
         let x = popup_anchor_col.min(max_x) as u16;
         let y = grid_start_row;
+        let full_inner_area = Rect {
+            x: x + 1,
+            y: y + 1,
+            width: inner_width as u16,
+            height: max_inner_height as u16,
+        };
+
+        content.fill_rect(full_inner_area, " ", Style::default(), Tag::TabSuggestion);
+
+        let window_range = active_suggestions.row_window_to_show.get_window_range();
+        let mut selected_item_row: Option<u16> = None;
+
+        let mut current_y = y + 1;
+        let bottom_y = y + 1 + max_inner_height as u16;
+
+        for (_i, item) in items.iter().enumerate() {
+            let remaining_rows = bottom_y.saturating_sub(current_y) as usize;
+            if remaining_rows == 0 {
+                break;
+            }
+
+            content.move_cursor_to(current_y, x + 1);
+
+            let is_selected = active_suggestions.current_1d_index() == Some(item.filtered_idx);
+            let tag = Tag::Suggestion(item.filtered_idx);
+
+            if is_selected {
+                selected_item_row = Some(current_y);
+
+                let main_text_width = crate::content_utils::vec_spans_width(&item.spans);
+                let has_description = !item.description_frame.is_empty();
+                let desc_total_width = if has_description {
+                    crate::active_suggestions::SuggestionFormatted::DESCRIPTION_SEPARATOR.len()
+                        + item.description_frame_width
+                } else {
+                    0
+                };
+                let total_width = main_text_width + desc_total_width;
+
+                if total_width <= inner_width {
+                    // Fits on one line! Render with right-aligned description
+                    let spans = item.render(inner_width, true);
+                    let rect = Rect {
+                        x: x + 1,
+                        y: current_y,
+                        width: inner_width as u16,
+                        height: 1,
+                    };
+                    for span in spans {
+                        content.write_tagged_span_area(&TaggedSpan::new(span, tag), rect);
+                    }
+
+                    // Retroactive style/fill pass for the single row
+                    for col_idx in (x as usize + 1)..(x as usize + 1 + inner_width) {
+                        let cell = &mut content.buf[current_y as usize][col_idx];
+                        if cell.cell.symbol().is_empty() {
+                            cell.cell.set_symbol(" ");
+                        }
+                        cell.tag = tag;
+                        cell.cell
+                            .set_style(Palette::convert_to_highlighted(cell.cell.style()));
+                    }
+
+                    current_y += 1;
+                } else {
+                    // Does not fit! Wrap up to 2 lines
+                    let selected_spans = item.render_untruncated(true);
+
+                    let max_sug_height = 2.min(remaining_rows);
+                    if max_sug_height == 0 {
+                        break;
+                    }
+
+                    let rect = Rect {
+                        x: x + 1,
+                        y: current_y,
+                        width: inner_width as u16,
+                        height: max_sug_height as u16,
+                    };
+
+                    let item_start_row = current_y;
+                    let mut truncated = false;
+                    let mut last_content_end_col = (x + 1) as usize;
+
+                    for span in &selected_spans {
+                        let tagged_span = TaggedSpan::new(span.clone(), tag);
+                        if !content.write_tagged_span_area(&tagged_span, rect) {
+                            truncated = true;
+                            break;
+                        }
+                        last_content_end_col = content.cursor_position().col as usize;
+                    }
+
+                    let item_end_row = content.cursor_position().row;
+
+                    // Retroactive style/fill pass for the selected item rows to make sure they are highlighted properly
+                    for row_idx in item_start_row..=item_end_row {
+                        for col_idx in (x as usize + 1)..(x as usize + 1 + inner_width) {
+                            let cell = &mut content.buf[row_idx as usize][col_idx];
+                            if cell.cell.symbol().is_empty() {
+                                cell.cell.set_symbol(" ");
+                            }
+                            cell.tag = tag;
+                            cell.cell
+                                .set_style(Palette::convert_to_highlighted(cell.cell.style()));
+                        }
+                    }
+
+                    // Retroactive Ellipsis Pass if truncated
+                    if truncated {
+                        let mut last_row =
+                            if content.cursor_position().col as usize > (x as usize + 1) {
+                                content.cursor_position().row as usize
+                            } else {
+                                (content.cursor_position().row as usize).saturating_sub(1)
+                            };
+                        last_row = last_row.max(item_start_row as usize);
+
+                        let last_col = if content.cursor_position().col as usize > (x as usize + 1)
+                        {
+                            (content.cursor_position().col as usize).saturating_sub(1)
+                        } else {
+                            x as usize + inner_width
+                        };
+
+                        let ellipsis_style = Palette::convert_to_highlighted(Style::default());
+                        content.overwrite_with_char(last_row, last_col, "…", ellipsis_style, tag);
+                    }
+
+                    let occupied = item_end_row - item_start_row + 1;
+                    current_y += occupied;
+                }
+            } else {
+                let spans = item.render(inner_width, false);
+                let rect = Rect {
+                    x: x + 1,
+                    y: current_y,
+                    width: inner_width as u16,
+                    height: 1,
+                };
+                for span in spans {
+                    content.write_tagged_span_area(&TaggedSpan::new(span, tag), rect);
+                }
+                current_y += 1;
+            }
+        }
+
+        let total_item_rows = current_y.saturating_sub(y + 1) as usize;
 
         let box_area = Rect {
             x,
             y,
             width: box_width as u16,
-            height: (num_rows_visible + 2) as u16,
+            height: (total_item_rows + 2) as u16,
         };
-
-        let full_inner_area = Rect {
-            x: x + 1,
-            y: y + 1,
-            width: inner_width as u16,
-            height: num_rows_visible as u16,
-        };
-
-        content.fill_rect(full_inner_area, " ", Style::default(), Tag::TabSuggestion);
 
         let status_line = TaggedLine::from(vec![
             TaggedSpan::new(
@@ -1464,29 +1600,10 @@ impl<'a> App<'a> {
             Some(status_line),
         );
 
-        let window_range = active_suggestions.row_window_to_show.get_window_range();
-        let mut selected_grid_row: Option<u16> = None;
-
-        for (i, item) in items.iter().enumerate() {
-            let item_row = y + 1 + i as u16;
-            content.move_cursor_to(item_row, x + 1);
-
-            let is_selected = active_suggestions.current_1d_index() == Some(item.filtered_idx);
-            if is_selected {
-                selected_grid_row = Some(i as u16);
-            }
-            let spans = item.render(inner_width, is_selected);
-            let tag = Tag::Suggestion(item.filtered_idx);
-
-            for span in spans {
-                content.write_tagged_span_area(&TaggedSpan::new(span, tag), full_inner_area);
-            }
-        }
-
         content.draw_vertical_scrollbar(
             x + box_width as u16 - 1,
             y + 1,
-            num_rows_visible as u16,
+            total_item_rows as u16,
             active_suggestions.filtered_suggestions_len(),
             num_rows_visible,
             window_range.start,
@@ -1494,12 +1611,30 @@ impl<'a> App<'a> {
             settings.colour_palette.secondary_text(),
         );
 
-        if let Some(sel_row) = selected_grid_row {
-            content.set_focus_row(y + 1 + sel_row);
+        if let Some(sel_row) = selected_item_row {
+            content.set_focus_row(sel_row);
         }
 
-        content.move_cursor_to(y + num_rows_visible as u16 + 2, 0);
+        // Cleanup unused pre-cleared rows below the border bottom
+        for row_idx in (y + total_item_rows as u16 + 2)..(y + max_inner_height as u16 + 2) {
+            if (row_idx as usize) < content.buf.len() {
+                for col_idx in x as usize..(x as usize + box_width) {
+                    if col_idx < content.buf[row_idx as usize].len() {
+                        let cell = &mut content.buf[row_idx as usize][col_idx];
+                        cell.cell.reset();
+                        cell.tag = Tag::Blank;
+                    }
+                }
+            }
+        }
+
+        content.move_cursor_to(y + total_item_rows as u16 + 2, 0);
         content.newline();
+
+        let final_buf_len = (y + total_item_rows as u16 + 3) as usize;
+        if content.buf.len() > final_buf_len {
+            content.buf.truncate(final_buf_len);
+        }
     }
 
     fn render_auto_suggestions_loading(
@@ -1794,5 +1929,239 @@ mod tests {
         let row1: String = content.buf[1].iter().map(|c| c.cell.symbol()).collect();
         // Index is "1 100       ", command text is "abcde", emoji is cleared and replaced by "…", followed by a blank space (cleared second cell of emoji)
         assert_eq!(row1, "1 100       abcde… ");
+    }
+
+    #[test]
+    fn test_render_auto_suggestions_selected_wrapping_and_ellipsis() {
+        use crate::active_suggestions::{
+            ActiveSuggestions, ActiveSuggestionsBuilder, ProcessedSuggestion, SuggestionDescription,
+        };
+        use crate::settings::Settings;
+
+        let settings = Settings::default();
+        let mut content = Contents::new(40);
+
+        let mut sug1 = ProcessedSuggestion::new("sug1", "", "");
+        // Selected suggestion value + description is long enough to wrap across multiple rows on width=40.
+        sug1.description = SuggestionDescription::Static(vec![Span::raw(
+            "this description is extremely long and will wrap multiple times to test the 4 line limit and ellipsis. We make it even longer to ensure it exceeds 4 lines at 38 columns, forcing truncation and an ellipsis.",
+        )]);
+
+        let builder = ActiveSuggestionsBuilder {
+            processed: vec![
+                sug1,
+                ProcessedSuggestion::new("sug2", "", ""),
+                ProcessedSuggestion::new("sug3", "", ""),
+                ProcessedSuggestion::new("sug4", "", ""),
+                ProcessedSuggestion::new("sug5", "", ""),
+            ],
+            unprocessed: std::collections::VecDeque::new(),
+            common_prefix: None,
+            auto_accept_if_solo: false,
+            insert_common_prefix: false,
+            comp_type: crate::tab_completion_context::CompType::FirstWord,
+            nosort: false,
+            compspec_was_useful: true,
+        };
+
+        let mut active = ActiveSuggestions::new(
+            builder,
+            crate::text_buffer::SubString::new("", "").unwrap(),
+            std::time::Duration::from_millis(0),
+            true, // auto_started
+            crate::settings::SuggestionSortOrder::default(),
+        );
+
+        // Select the first suggestion (sug1)
+        active.selected_coord = Some((0, 0));
+
+        App::render_auto_suggestions(
+            &settings,
+            &mut active,
+            &mut content,
+            40,               // width
+            20,               // rows_left_before_end_of_screen
+            None,             // cursor_pos_maybe
+            "",               // buffer
+            0,                // cursor_byte_pos
+            Style::default(), // scrollbar_style
+        );
+
+        // The first suggestion (selected) should have wrapped across 2 lines.
+        // The second suggestion (unselected) should take 1 line.
+        // Total height of the buffer should be exactly 9 (newline, y=1 border top, 5 inner rows, border bottom, newline).
+        assert_eq!(content.height(), 9);
+
+        // We expect the selected suggestion rows to have their cells tagged with Tag::Suggestion(0).
+        let suggestion_0_rows = content
+            .buf
+            .iter()
+            .filter(|row| row.iter().any(|c| matches!(c.tag, Tag::Suggestion(0))))
+            .count();
+
+        // Since it's limited to 2 lines, it should be exactly 2 rows!
+        assert_eq!(suggestion_0_rows, 2);
+
+        // Also we expect the last line of Suggestion(0) to end with '…' because it was truncated.
+        let last_sug_0_row_idx = content
+            .buf
+            .iter()
+            .rposition(|row| row.iter().any(|c| matches!(c.tag, Tag::Suggestion(0))))
+            .unwrap();
+        let last_sug_0_row_str: String = content.buf[last_sug_0_row_idx]
+            .iter()
+            .map(|c| c.cell.symbol())
+            .collect();
+        assert!(last_sug_0_row_str.contains("…"));
+    }
+
+    #[test]
+    fn test_render_auto_suggestions_unselected_ellipsis_and_selected_no_wrap() {
+        use crate::active_suggestions::{
+            ActiveSuggestions, ActiveSuggestionsBuilder, ProcessedSuggestion, SuggestionDescription,
+        };
+        use crate::settings::Settings;
+
+        let settings = Settings::default();
+        let mut content = Contents::new(40);
+
+        let mut sug1 = ProcessedSuggestion::new("sug1", "", "");
+        // Fits fully on 1 line: "sug1" (4) + separator (2) + "desc1" (5) = 11 <= 38.
+        sug1.description = SuggestionDescription::Static(vec![Span::raw("desc1")]);
+
+        let mut sug2 = ProcessedSuggestion::new("sug2", "", "");
+        // Too long for unselected line, description will be cut short.
+        sug2.description = SuggestionDescription::Static(vec![Span::raw(
+            "this description is very long and will be truncated with an ellipsis at the end of the line",
+        )]);
+
+        let builder = ActiveSuggestionsBuilder {
+            processed: vec![sug1, sug2],
+            unprocessed: std::collections::VecDeque::new(),
+            common_prefix: None,
+            auto_accept_if_solo: false,
+            insert_common_prefix: false,
+            comp_type: crate::tab_completion_context::CompType::FirstWord,
+            nosort: false,
+            compspec_was_useful: true,
+        };
+
+        let mut active = ActiveSuggestions::new(
+            builder,
+            crate::text_buffer::SubString::new("", "").unwrap(),
+            std::time::Duration::from_millis(0),
+            true, // auto_started
+            crate::settings::SuggestionSortOrder::default(),
+        );
+
+        // Select the first suggestion (sug1, which fits fully)
+        active.selected_coord = Some((0, 0));
+
+        App::render_auto_suggestions(
+            &settings,
+            &mut active,
+            &mut content,
+            40,               // width
+            20,               // rows_left_before_end_of_screen
+            None,             // cursor_pos_maybe
+            "",               // buffer
+            0,                // cursor_byte_pos
+            Style::default(), // scrollbar_style
+        );
+
+        // Expect:
+        // - row 2: sug1 (selected), fits on 1 line, description "desc1" is right-aligned.
+        // - row 3: sug2 (unselected), description cut short, ends with "…".
+
+        let row2_str: String = content.buf[2].iter().map(|c| c.cell.symbol()).collect();
+        let chars2: Vec<char> = row2_str.chars().collect();
+        let inner_row2: String = chars2[1..39].iter().collect();
+        assert!(inner_row2.starts_with("sug1"));
+        assert!(inner_row2.ends_with("desc1"));
+        assert!(!inner_row2.contains('…'));
+
+        let row3_str: String = content.buf[3].iter().map(|c| c.cell.symbol()).collect();
+        let chars3: Vec<char> = row3_str.chars().collect();
+        let inner_row3: String = chars3[1..39].iter().collect();
+        assert!(inner_row3.starts_with("sug2"));
+        assert!(inner_row3.ends_with("…"));
+
+        assert_eq!(content.height(), 6);
+    }
+
+    #[test]
+    fn test_render_auto_suggestions_selected_wrapping_two_possibilities() {
+        use crate::active_suggestions::{
+            ActiveSuggestions, ActiveSuggestionsBuilder, ProcessedSuggestion, SuggestionDescription,
+        };
+        use crate::settings::Settings;
+
+        let settings = Settings::default();
+        let mut content = Contents::new(40);
+
+        let mut sug1 = ProcessedSuggestion::new("sug1", "", "");
+        // Selected suggestion value + description wraps to exactly 2 rows on width=40.
+        // inner width = 40 - 2 = 38.
+        sug1.description = SuggestionDescription::Static(vec![Span::raw(
+            "this description is medium-long and wraps to exactly two rows",
+        )]);
+
+        let mut sug2 = ProcessedSuggestion::new("sug2", "", "");
+        sug2.description = SuggestionDescription::Static(vec![Span::raw("desc2")]);
+
+        let builder = ActiveSuggestionsBuilder {
+            processed: vec![sug1, sug2],
+            unprocessed: std::collections::VecDeque::new(),
+            common_prefix: None,
+            auto_accept_if_solo: false,
+            insert_common_prefix: false,
+            comp_type: crate::tab_completion_context::CompType::FirstWord,
+            nosort: false,
+            compspec_was_useful: true,
+        };
+
+        let mut active = ActiveSuggestions::new(
+            builder,
+            crate::text_buffer::SubString::new("", "").unwrap(),
+            std::time::Duration::from_millis(0),
+            true, // auto_started
+            crate::settings::SuggestionSortOrder::default(),
+        );
+
+        // Select the first suggestion (sug1)
+        active.selected_coord = Some((0, 0));
+
+        App::render_auto_suggestions(
+            &settings,
+            &mut active,
+            &mut content,
+            40,               // width
+            20,               // rows_left_before_end_of_screen
+            None,             // cursor_pos_maybe
+            "",               // buffer
+            0,                // cursor_byte_pos
+            Style::default(), // scrollbar_style
+        );
+
+        // Expect:
+        // - row 2: sug1 (selected), first line
+        // - row 3: sug1 (selected), second line
+        // - row 4: sug2 (unselected), fits on 1 line
+        // Total height should be exactly 7 (newline, top border, 3 inner rows, bottom border, newline).
+        assert_eq!(content.height(), 7);
+
+        let suggestion_0_rows = content
+            .buf
+            .iter()
+            .filter(|row| row.iter().any(|c| matches!(c.tag, Tag::Suggestion(0))))
+            .count();
+        assert_eq!(suggestion_0_rows, 2);
+
+        let suggestion_1_rows = content
+            .buf
+            .iter()
+            .filter(|row| row.iter().any(|c| matches!(c.tag, Tag::Suggestion(1))))
+            .count();
+        assert_eq!(suggestion_1_rows, 1);
     }
 }
