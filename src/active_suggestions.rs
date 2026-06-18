@@ -313,11 +313,7 @@ impl SuggestionFormatted {
             " ".repeat(col_width.saturating_sub(rendered_total)),
         ));
 
-        let desc_style = if is_selected {
-            Style::default()
-        } else {
-            self.description_style
-        };
+        let desc_style = self.description_style;
 
         // Append description if there is space for it.
         if desc_render_width > 0 {
@@ -357,18 +353,12 @@ impl SuggestionFormatted {
         }
         if !self.description_frame.is_empty() {
             spans.push(Span::raw(Self::DESCRIPTION_SEPARATOR));
-            let desc_style = if is_selected {
-                Style::default()
-            } else {
-                self.description_style
-            };
-            spans.extend(self.description_frame.iter().map(|span| {
-                let mut s = Span::styled(span.content.clone(), desc_style.patch(span.style));
-                if is_selected {
-                    s.style = Palette::convert_to_highlighted(s.style);
-                }
-                s
-            }));
+            let desc_style = self.description_style;
+            spans.extend(
+                self.description_frame
+                    .iter()
+                    .map(|span| Span::styled(span.content.clone(), desc_style.patch(span.style))),
+            );
         }
         spans
     }
