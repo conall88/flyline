@@ -480,7 +480,31 @@ impl<'a> App<'a> {
                 &TaggedLine::from_line(
                     Line::from(format!(
                         "key: {}  context: {}  action: {}",
-                        last_key.display, last_key.context, last_key.action
+                        last_key.display,
+                        last_key.context,
+                        last_key.action.as_ref()
+                    ))
+                    .style(
+                        self.settings
+                            .colour_palette
+                            .secondary_text()
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Tag::Normal,
+                ),
+                true,
+            );
+        }
+
+        if self.mode.is_running()
+            && self.settings.mouse_debug
+            && let Some(last_mouse) = &self.last_mouse
+        {
+            content.write_tagged_line(
+                &TaggedLine::from_line(
+                    Line::from(format!(
+                        "mouse: kind: {:?}  column: {}  row: {}  modifiers: {:?}",
+                        last_mouse.kind, last_mouse.column, last_mouse.row, last_mouse.modifiers
                     ))
                     .style(
                         self.settings
