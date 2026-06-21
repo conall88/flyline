@@ -568,6 +568,8 @@ pub enum Action {
     CutSelection,
     #[strum(message = "Paste from the system clipboard")]
     PasteSystemClipboard,
+    #[strum(message = "Insert the last word from the previous command in history")]
+    InsertLastWordFromPrevCommand,
     #[strum(message = "Select the entire command buffer")]
     SelectAll,
     #[strum(message = "Do nothing (useful for unbinding a key)")]
@@ -1066,6 +1068,37 @@ impl Action {
                 let mut stdout = std::io::stdout();
                 let _ = stdout.write_all(b"\x1b]52;c;?\x07");
                 let _ = stdout.flush();
+            }
+            Action::InsertLastWordFromPrevCommand => {
+                app.buffer.clear_selection();
+
+                // Get the last word of the history command we are currently looking at
+                let last_word_of_current_history_cmd = app
+                    .history_manager
+                    .get_last_word_insert_command()
+                    .and_then(|cmd| crate::history::get_last_word(cmd));
+
+                // Find if the last word of the current history command is touching the cursor
+                let target_sub = last_word_of_current_history_cmd
+                    .as_ref()
+                    .and_then(|last_word| app.buffer.is_cursor_on_s(last_word));
+
+                let is_continuation = target_sub.is_some();
+
+                if !is_continuation {
+                    app.history_manager.last_word_insert_reset();
+                }
+
+                // Move to the previous command with non-empty words
+                if let Some(cmd) = app.history_manager.last_word_insert_move_prev() {
+                    if let Some(w) = crate::history::get_last_word(cmd) {
+                        if let Some(sub) = &target_sub {
+                            let _ = app.buffer.replace_word_under_cursor(&w, sub);
+                        } else {
+                            app.buffer.insert_str(&w);
+                        }
+                    }
+                }
             }
             Action::Nothing => {}
             Action::StartPromptDirSelect => {
@@ -1691,8 +1724,13 @@ pub fn expand_variations_one(kem: KeyEventMatch) -> Vec<KeyEventMatch> {
                     exact(BackTab, M::SHIFT),
                 ];
             }
-            // Ctrl+Backspace, Ctrl+H, Ctrl+W are equivalent in many terminals.
-            // (No-op fallthrough; explicit chords are passed through unchanged.)
+            // Fallback for any other key with ALT or META
+            (code, m) if m == M::ALT => {
+                return vec![exact(code, M::ALT), exact(code, M::META)];
+            }
+            (code, m) if m == M::META => {
+                return vec![exact(code, M::META), exact(code, M::ALT)];
+            }
             _ => {}
         }
     }
@@ -1745,6 +1783,18 @@ mod expand_variations_tests {
             vec![
                 KeyEventMatch::Exact(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT)),
                 KeyEventMatch::Exact(KeyEvent::new(KeyCode::Backspace, KeyModifiers::META)),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_expand_variations_alt_to_meta_generic() {
+        let v = expand_variations![KeyModifiers::ALT + KeyCode::Char('.').into()];
+        assert_eq!(
+            v,
+            vec![
+                KeyEventMatch::Exact(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::ALT)),
+                KeyEventMatch::Exact(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::META)),
             ]
         );
     }
@@ -2290,6 +2340,12 @@ static DEFAULT_BINDINGS: LazyLock<Vec<Binding>> = LazyLock::new(|| {
             ],
             ContextVar::Always.into(),
             Action::PasteSystemClipboard,
+        ),
+        // Insert last word from previous history command on Alt+.
+        Binding::new(
+            &expand_variations![M::ALT + KC::Char('.').into(),],
+            ContextVar::Always.into(),
+            Action::InsertLastWordFromPrevCommand,
         ),
         Binding::new(
             // Ctrl+/ (shows as Ctrl+7) - comment out and execute
@@ -3075,6 +3131,7 @@ impl<'a> App<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::Settings;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn key(code: KeyCode) -> KeyEvent {
