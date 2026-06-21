@@ -374,7 +374,7 @@ This is similar to [inshellisense](https://github.com/microsoft/inshellisense) b
 ### Fuzzy tab completion search
 When you're presented with suggestions, you can type to fuzzily search through the list:
 
-[![Fuzzy path suggestions demo](https://github.com/HalFrgrd/flyline/releases/download/assets/demo_fuzzy_path_suggestions.gif)](https://github.com/HalFrgrd/evp)
+[![Fuzzy path suggestions demo](https://github.com/HalFrgrd/flyline/releases/download/assets/demo_fuzzy_suggestions.gif)](https://github.com/HalFrgrd/evp)
 
 ### Fuzzy path completion
 The last path segments from the cursor to the end will be fuzzily matched on the directory contents:
@@ -399,9 +399,10 @@ ANSI styling is supported in descriptions: any ANSI colour/style escape codes em
 
 Descriptions for files are the time since last modified.
 
-### Automatically complete based on `--help`
-Coming soon: Automatically generate a completion spec for commands without one.
-For now, you can manually generate a Bash completion script using the standalone `flycomp` tool: `flycomp your_command`.
+### Automatic completion synthesis (flycomp)
+If a command lacks a completion script, flyline can invoke [flycomp](https://github.com/HalFrgrd/flycomp) to dynamically synthesize one by parsing its `--help` outputs and man pages. You type the command name, press Tab, then flyline will prompt you to run flycomp to generate the completion spec:
+
+[![Automatic completion synthesis demo](https://github.com/HalFrgrd/flyline/releases/download/assets/demo_flycomp.gif)](https://github.com/HalFrgrd/evp)
 
 ### `LS_COLORS` styling
 Flyline styles your filename tab completion results according to `$LS_COLORS`:
