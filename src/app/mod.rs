@@ -270,7 +270,6 @@ impl FuzzyHistorySource {
 pub(crate) struct TabCompletionHandle {
     receiver: std::sync::mpsc::Receiver<Option<(ActiveSuggestionsBuilder, std::time::Duration)>>,
     pid: Option<libc::pid_t>,
-    thread_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for TabCompletionHandle {
@@ -284,15 +283,18 @@ impl Drop for TabCompletionHandle {
         if let Some(pid) = self.pid.take() {
             unsafe {
                 libc::kill(pid, libc::SIGKILL);
-                let mut status = 0;
-                libc::waitpid(pid, &mut status, 0);
-                log::info!("Tab completion process (pid {}) reaped", pid);
+                // We don't need to wait for the pid here.
+                // The tab completion thread will wait for it and we wait for the thread when we unload the app.
             }
         }
-        if let Some(handle) = self.thread_handle.take() {
-            let _ = handle.join();
-        }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum FlycompPromptSelection {
+    Yes,
+    No,
+    DontAsk,
 }
 
 #[derive(Debug)]
@@ -332,7 +334,7 @@ pub(crate) enum ContentMode {
     TabCompletionAskForFlycomp {
         command_word: String,
         word_under_cursor: String,
-        selected_yes: bool,
+        selection: FlycompPromptSelection,
         sandbox: Option<String>,
         dump_path: String,
     },
@@ -937,19 +939,49 @@ impl<'a> App<'a> {
                 match mouse.kind {
                     MouseEventKind::ScrollUp => {
                         active_suggestions.on_up_arrow();
-                        return false;
+                        return true;
                     }
                     MouseEventKind::ScrollDown => {
                         active_suggestions.on_down_arrow();
-                        return false;
+                        return true;
                     }
                     MouseEventKind::ScrollLeft => {
                         active_suggestions.on_left_arrow();
-                        return false;
+                        return true;
                     }
                     MouseEventKind::ScrollRight => {
                         active_suggestions.on_right_arrow();
-                        return false;
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Handle scrolling on fuzzy history entries
+        let is_over_fuzzy_history = matches!(
+            clicked_tag,
+            Some(Tag::HistoryResult(_)) | Some(Tag::FuzzySearch)
+        );
+
+        if let ContentMode::FuzzyHistorySearch(ref source) = self.content_mode {
+            if is_over_fuzzy_history {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        let source = source.clone();
+                        self.select_fuzzy_history_manager_mut(&source)
+                            .fuzzy_search_onkeypress(
+                                crate::history::HistorySearchDirection::Forward,
+                            );
+                        return true;
+                    }
+                    MouseEventKind::ScrollDown => {
+                        let source = source.clone();
+                        self.select_fuzzy_history_manager_mut(&source)
+                            .fuzzy_search_onkeypress(
+                                crate::history::HistorySearchDirection::Backward,
+                            );
+                        return true;
                     }
                     _ => {}
                 }
@@ -1074,11 +1106,10 @@ impl<'a> App<'a> {
             Some(Tag::TabCompletionScrollBar { .. }) => {}
             Some(Tag::FlycompYes) => {
                 if let ContentMode::TabCompletionAskForFlycomp {
-                    ref mut selected_yes,
-                    ..
+                    ref mut selection, ..
                 } = self.content_mode
                 {
-                    *selected_yes = true;
+                    *selection = FlycompPromptSelection::Yes;
                     if matches!(mouse.kind, MouseEventKind::Up(event::MouseButton::Left)) {
                         let mode = std::mem::replace(&mut self.content_mode, ContentMode::Normal);
                         if let ContentMode::TabCompletionAskForFlycomp {
@@ -1090,18 +1121,34 @@ impl<'a> App<'a> {
                         {
                             self.run_flycomp(command_word, word_under_cursor, sandbox.is_some());
                         }
+                        return true;
                     }
                 }
             }
             Some(Tag::FlycompNo) => {
                 if let ContentMode::TabCompletionAskForFlycomp {
-                    ref mut selected_yes,
-                    ..
+                    ref mut selection, ..
                 } = self.content_mode
                 {
-                    *selected_yes = false;
+                    *selection = FlycompPromptSelection::No;
                     if matches!(mouse.kind, MouseEventKind::Up(event::MouseButton::Left)) {
                         self.content_mode = ContentMode::Normal;
+                        return true;
+                    }
+                }
+            }
+            Some(Tag::FlycompDontAsk) => {
+                if let ContentMode::TabCompletionAskForFlycomp {
+                    ref mut selection, ..
+                } = self.content_mode
+                {
+                    *selection = FlycompPromptSelection::DontAsk;
+                    if matches!(mouse.kind, MouseEventKind::Up(event::MouseButton::Left)) {
+                        let mode = std::mem::replace(&mut self.content_mode, ContentMode::Normal);
+                        if let ContentMode::TabCompletionAskForFlycomp { command_word, .. } = mode {
+                            self.settings.flycomp_blacklist.insert(command_word);
+                        }
+                        return true;
                     }
                 }
             }
@@ -1188,7 +1235,7 @@ impl<'a> App<'a> {
 
                     self.right_click_popup_pos = None;
                     self.right_click_copy_target = None;
-                    update_buffer = true;
+                    self.mode = AppRunningState::Exiting(ExitState::WithoutCommand);
                 }
             }
             Some(Tag::Suggestion(idx)) => {
@@ -1579,16 +1626,27 @@ impl<'a> App<'a> {
             match handle.receiver.try_recv() {
                 Ok(Some((builder, elapsed))) => {
                     // Take ownership of wuc_substring from the waiting state.
-                    let wuc = match std::mem::replace(&mut self.content_mode, ContentMode::Normal) {
-                        ContentMode::TabCompletionWaiting { wuc_substring, .. } => wuc_substring,
-                        _ => unreachable!(),
-                    };
+                    let (wuc, mut handle) =
+                        match std::mem::replace(&mut self.content_mode, ContentMode::Normal) {
+                            ContentMode::TabCompletionWaiting {
+                                wuc_substring,
+                                handle,
+                                ..
+                            } => (wuc_substring, handle),
+                            _ => unreachable!(),
+                        };
+                    handle.pid = None; // defuse
                     self.finish_tab_complete(builder, wuc, elapsed, auto_started);
                     self.on_possible_buffer_change();
                     return true;
                 }
                 Ok(None) => {
                     // No suggestions generated.
+                    if let ContentMode::TabCompletionWaiting { mut handle, .. } =
+                        std::mem::replace(&mut self.content_mode, ContentMode::Normal)
+                    {
+                        handle.pid = None; // defuse
+                    }
                     self.content_mode = ContentMode::Normal;
                     return true;
                 }

@@ -56,27 +56,20 @@ impl DrawnContent {
         let direct_contact = content_buf_row.get(term_em_x as usize);
         let direct_tag = direct_contact.map(|cell| cell.tag).unwrap_or(Tag::Blank);
 
-        if matches!(
+        if !matches!(
             direct_tag,
-            Tag::Command(_)
-                | Tag::Suggestion(_)
-                | Tag::HistoryResult(_)
-                | Tag::AiResult(_)
-                | Tag::TutorialPrev
-                | Tag::TutorialNext
-                | Tag::PromptCopyBufferWidget
-                | Tag::Clipboard(_)
-                | Tag::Ps1PromptCwdWidget(_)
-                | Tag::TabCompletionScrollBar { .. }
-                | Tag::FlycompSandboxInfo
-                | Tag::FlycompInfo
-                | Tag::RightClickCopy
-                | Tag::RightClickCut
-                | Tag::RightClickPaste
-                | Tag::RightClickUndo
-                | Tag::RightClickRedo
-                | Tag::RightClickRunTutorial
-                | Tag::RightClickMenu
+            Tag::Blank
+                | Tag::Normal
+                | Tag::Ps1Prompt
+                | Tag::Ps1PromptDynamicTime
+                | Tag::Ps1PromptAnimation
+                | Tag::Ps2Prompt
+                | Tag::TabSuggestion
+                | Tag::HistorySuggestion
+                | Tag::FuzzySearch
+                | Tag::Tooltip
+                | Tag::Tutorial
+                | Tag::MultiWidthContinuation
         ) {
             return Some((direct_tag, direct_tag));
         }
@@ -863,7 +856,7 @@ impl<'a> App<'a> {
             }
             ContentMode::TabCompletionAskForFlycomp {
                 command_word,
-                selected_yes,
+                selection,
                 sandbox,
                 dump_path,
                 ..
@@ -974,7 +967,7 @@ impl<'a> App<'a> {
                 ));
 
                 // Yes button
-                let yes_style = if *selected_yes {
+                let yes_style = if *selection == FlycompPromptSelection::Yes {
                     Style::default()
                         .fg(Color::Black)
                         .bg(Color::Green)
@@ -990,7 +983,7 @@ impl<'a> App<'a> {
                 content.write_tagged_span(&TaggedSpan::new(Span::raw(" "), Tag::Normal));
 
                 // No button
-                let no_style = if !*selected_yes {
+                let no_style = if *selection == FlycompPromptSelection::No {
                     Style::default()
                         .fg(Color::Black)
                         .bg(Color::Red)
@@ -1001,6 +994,22 @@ impl<'a> App<'a> {
                 content.write_tagged_span(&TaggedSpan::new(
                     Span::styled(" [No] ", no_style),
                     Tag::FlycompNo,
+                ));
+
+                content.write_tagged_span(&TaggedSpan::new(Span::raw(" "), Tag::Normal));
+
+                // Don't Ask button
+                let dont_ask_style = if *selection == FlycompPromptSelection::DontAsk {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Red)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Red)
+                };
+                content.write_tagged_span(&TaggedSpan::new(
+                    Span::styled(" [No, don't ask again] ", dont_ask_style),
+                    Tag::FlycompDontAsk,
                 ));
                 content.newline();
 
@@ -1380,16 +1389,19 @@ impl<'a> App<'a> {
                 ("Paste", Tag::RightClickPaste),
                 ("Undo", Tag::RightClickUndo),
                 ("Redo", Tag::RightClickRedo),
-                ("Run Tutorial", Tag::RightClickRunTutorial),
             ];
+            let extra_entries = [("Run Tutorial", Tag::RightClickRunTutorial)];
             let selected_tag = self.mouse_state.last_mouse_over_cell_semantic;
             let style = self.settings.colour_palette.right_click_menu();
             let selected_style = Palette::convert_to_highlighted(style);
             let info_lines = ["Toggle mouse capture", "with Escape."];
             let secondary_style = style.fg(ratatui::style::Color::DarkGray);
+            let is_left_button_down = self.mouse_state.is_left_button_down();
             content.draw_menu(
                 &entries,
+                &extra_entries,
                 selected_tag,
+                is_left_button_down,
                 popup_pos.row + 1,
                 popup_pos.col,
                 terminal_height,
@@ -1646,11 +1658,42 @@ impl<'a> App<'a> {
         let y = cursor_pos_maybe
             .map(|pos| pos.row + 1)
             .unwrap_or(grid_start_row);
+
+        let mut total_item_rows = 0;
+        let bottom_y = y + 1 + max_inner_height as u16;
+        for item in &items {
+            let remaining_rows =
+                (bottom_y as usize).saturating_sub((y + 1) as usize + total_item_rows);
+            if remaining_rows == 0 {
+                break;
+            }
+            let is_selected = active_suggestions.current_1d_index() == Some(item.filtered_idx);
+            if is_selected {
+                let main_text_width = crate::content_utils::vec_spans_width(&item.spans);
+                let has_description = !item.description_frame.is_empty();
+                let desc_total_width = if has_description {
+                    crate::active_suggestions::SuggestionFormatted::DESCRIPTION_SEPARATOR.len()
+                        + item.description_frame_width
+                } else {
+                    0
+                };
+                let total_width = main_text_width + desc_total_width;
+                if total_width <= inner_width {
+                    total_item_rows += 1;
+                } else {
+                    let occupied = 2.min(remaining_rows);
+                    total_item_rows += occupied;
+                }
+            } else {
+                total_item_rows += 1;
+            }
+        }
+
         let full_inner_area = Rect {
             x: x + 1,
             y: y + 1,
             width: inner_width as u16,
-            height: max_inner_height as u16,
+            height: total_item_rows as u16,
         };
 
         content.fill_rect(full_inner_area, " ", Style::default(), Tag::TabSuggestion);
@@ -1857,19 +1900,6 @@ impl<'a> App<'a> {
             content.set_focus_row(sel_row);
         }
 
-        // Cleanup unused pre-cleared rows below the border bottom
-        for row_idx in (y + total_item_rows as u16 + 2)..(y + max_inner_height as u16 + 2) {
-            if (row_idx as usize) < content.buf.len() {
-                for col_idx in x as usize..(x as usize + box_width) {
-                    if col_idx < content.buf[row_idx as usize].len() {
-                        let cell = &mut content.buf[row_idx as usize][col_idx];
-                        cell.cell.reset();
-                        cell.tag = Tag::Blank;
-                    }
-                }
-            }
-        }
-
         content.move_cursor_to(y + total_item_rows as u16 + 2, 0);
         content.newline();
 
@@ -2048,10 +2078,13 @@ mod tests {
         // We expect it to write 1 line (plus a newline at the start)
         assert_eq!(content.height(), 2);
 
-        let row1: String = content.buf[1].iter().map(|c| c.cell.symbol()).collect();
-        assert!(row1.starts_with("1 100       "));
-        assert!(row1.ends_with("…"));
-        assert_eq!(row1, "1 100       this is…");
+        assert_eq!(
+            content.get_buffer_lines(),
+            vec![
+                "                    ".to_string(),
+                "1 100       this is…".to_string(),
+            ]
+        );
     }
     #[test]
     fn test_render_history_entry_multiline_selected() {
@@ -2079,11 +2112,14 @@ mod tests {
         // Fits on two rows, so we expect exactly 2 rows (plus initial newline)
         assert_eq!(content.height(), 3);
 
-        let row1: String = content.buf[1].iter().map(|c| c.cell.symbol()).collect();
-        assert_eq!(row1, "1 100      ▐short comm");
-
-        let row2: String = content.buf[2].iter().map(|c| c.cell.symbol()).collect();
-        assert_eq!(row2, "           ▐and       ");
+        assert_eq!(
+            content.get_buffer_lines(),
+            vec![
+                "                      ".to_string(),
+                "1 100      ▐short comm".to_string(),
+                "           ▐and       ".to_string(),
+            ]
+        );
     }
     #[test]
     fn test_render_history_entry_multiline_unselected_ellipsis() {
@@ -2115,9 +2151,13 @@ mod tests {
         // We expect it to write 1 line (plus a newline at the start)
         assert_eq!(content.height(), 2);
 
-        let row1: String = content.buf[1].iter().map(|c| c.cell.symbol()).collect();
-        // Index is "1 100       ", command prefix is "echo \"", then "…", then spaces
-        assert_eq!(row1, "1 100       echo \"…      ");
+        assert_eq!(
+            content.get_buffer_lines(),
+            vec![
+                "                         ".to_string(),
+                "1 100       echo \"…      ".to_string(),
+            ]
+        );
     }
     #[test]
     fn test_render_history_entry_multiline_selected_truncation() {
@@ -2149,18 +2189,16 @@ mod tests {
         // Expect 4 rows (plus initial newline) => height = 5
         assert_eq!(content.height(), 5);
 
-        let row1: String = content.buf[1].iter().map(|c| c.cell.symbol()).collect();
-        assert_eq!(row1, "1 100      ▐line1   ");
-
-        let row2: String = content.buf[2].iter().map(|c| c.cell.symbol()).collect();
-        assert_eq!(row2, "        2/5▐line2   ");
-
-        let row3: String = content.buf[3].iter().map(|c| c.cell.symbol()).collect();
-        assert_eq!(row3, "        3/5▐line3   ");
-
-        let row4: String = content.buf[4].iter().map(|c| c.cell.symbol()).collect();
-        // Since it's truncated at row 4, we expect an ellipsis
-        assert_eq!(row4, "        4/5▐line4…  ");
+        assert_eq!(
+            content.get_buffer_lines(),
+            vec![
+                "                    ".to_string(),
+                "1 100      ▐line1   ".to_string(),
+                "        2/5▐line2   ".to_string(),
+                "        3/5▐line3   ".to_string(),
+                "        4/5▐line4…  ".to_string(),
+            ]
+        );
     }
     #[test]
     fn test_render_history_entry_multiwidth_character_truncation() {
@@ -2189,9 +2227,13 @@ mod tests {
         // We expect it to write 1 line (plus initial newline) => height = 2
         assert_eq!(content.height(), 2);
 
-        let row1: String = content.buf[1].iter().map(|c| c.cell.symbol()).collect();
-        // Index is "1 100       ", command text is "abcde", emoji is cleared and replaced by "…", followed by a blank space (cleared second cell of emoji)
-        assert_eq!(row1, "1 100       abcde… ");
+        assert_eq!(
+            content.get_buffer_lines(),
+            vec![
+                "                   ".to_string(),
+                "1 100       abcde… ".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -2251,10 +2293,20 @@ mod tests {
             Style::default(), // scrollbar_style
         );
 
-        // The first suggestion (selected) should have wrapped across 2 lines.
-        // The second suggestion (unselected) should take 1 line.
-        // Total height of the buffer should be exactly 9 (newline, y=1 border top, 5 inner rows, border bottom, newline).
-        assert_eq!(content.height(), 9);
+        assert_eq!(
+            content.get_buffer_lines(),
+            vec![
+                "                                        ".to_string(),
+                "╭──────────────────────────────────────╮".to_string(),
+                "│sug1  this description is extremely lo│".to_string(),
+                "│ng and will wrap multiple times to te…│".to_string(),
+                "│sug2                                  │".to_string(),
+                "│sug3                                  │".to_string(),
+                "│sug4                                  │".to_string(),
+                "╰─ Pos: 1/5; 0.0ms─────────────────────╯".to_string(),
+                "                                        ".to_string(),
+            ]
+        );
 
         // We expect the selected suggestion rows to have their cells tagged with Tag::Suggestion(0).
         let suggestion_0_rows = content
@@ -2265,18 +2317,6 @@ mod tests {
 
         // Since it's limited to 2 lines, it should be exactly 2 rows!
         assert_eq!(suggestion_0_rows, 2);
-
-        // Also we expect the last line of Suggestion(0) to end with '…' because it was truncated.
-        let last_sug_0_row_idx = content
-            .buf
-            .iter()
-            .rposition(|row| row.iter().any(|c| matches!(c.tag, Tag::Suggestion(0))))
-            .unwrap();
-        let last_sug_0_row_str: String = content.buf[last_sug_0_row_idx]
-            .iter()
-            .map(|c| c.cell.symbol())
-            .collect();
-        assert!(last_sug_0_row_str.contains("…"));
     }
 
     #[test]
@@ -2333,24 +2373,17 @@ mod tests {
             Style::default(), // scrollbar_style
         );
 
-        // Expect:
-        // - row 2: sug1 (selected), fits on 1 line, description "desc1" is right-aligned.
-        // - row 3: sug2 (unselected), description cut short, ends with "…".
-
-        let row2_str: String = content.buf[2].iter().map(|c| c.cell.symbol()).collect();
-        let chars2: Vec<char> = row2_str.chars().collect();
-        let inner_row2: String = chars2[1..39].iter().collect();
-        assert!(inner_row2.starts_with("sug1"));
-        assert!(inner_row2.ends_with("desc1"));
-        assert!(!inner_row2.contains('…'));
-
-        let row3_str: String = content.buf[3].iter().map(|c| c.cell.symbol()).collect();
-        let chars3: Vec<char> = row3_str.chars().collect();
-        let inner_row3: String = chars3[1..39].iter().collect();
-        assert!(inner_row3.starts_with("sug2"));
-        assert!(inner_row3.ends_with("…"));
-
-        assert_eq!(content.height(), 6);
+        assert_eq!(
+            content.get_buffer_lines(),
+            vec![
+                "                                        ".to_string(),
+                "╭──────────────────────────────────────╮".to_string(),
+                "│sug1                             desc1│".to_string(),
+                "│sug2  this description is very long a…│".to_string(),
+                "╰─ Pos: 1/2; 0.0ms─────────────────────╯".to_string(),
+                "                                        ".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -2407,12 +2440,18 @@ mod tests {
             Style::default(), // scrollbar_style
         );
 
-        // Expect:
-        // - row 2: sug1 (selected), first line
-        // - row 3: sug1 (selected), second line
-        // - row 4: sug2 (unselected), fits on 1 line
-        // Total height should be exactly 7 (newline, top border, 3 inner rows, bottom border, newline).
-        assert_eq!(content.height(), 7);
+        assert_eq!(
+            content.get_buffer_lines(),
+            vec![
+                "                                        ".to_string(),
+                "╭──────────────────────────────────────╮".to_string(),
+                "│sug1  this description is medium-long │".to_string(),
+                "│and wraps to exactly two rows         │".to_string(),
+                "│sug2                             desc2│".to_string(),
+                "╰─ Pos: 1/2; 0.0ms─────────────────────╯".to_string(),
+                "                                        ".to_string(),
+            ]
+        );
 
         let suggestion_0_rows = content
             .buf
@@ -2427,5 +2466,88 @@ mod tests {
             .filter(|row| row.iter().any(|c| matches!(c.tag, Tag::Suggestion(1))))
             .count();
         assert_eq!(suggestion_1_rows, 1);
+    }
+
+    #[test]
+    fn test_render_auto_suggestions_does_not_clear_excessive_rows() {
+        use crate::active_suggestions::{
+            ActiveSuggestions, ActiveSuggestionsBuilder, ProcessedSuggestion,
+        };
+        use crate::settings::Settings;
+
+        let mut settings = Settings::default();
+        // Set maximum number of suggestion rows to 5
+        settings.num_suggestion_rows = 5;
+
+        // Create contents with 10 rows (so indices 0 to 9 are valid)
+        let mut content = Contents::new(40);
+        for _ in 0..10 {
+            content.increase_buf_single_row();
+        }
+
+        // Pre-populate row 6 (index 6) with some sentinel text
+        let tag_sentinel = Tag::Normal;
+        let style_sentinel = Style::default().fg(Color::Yellow);
+        content.overwrite_with_char(6, 5, "X", style_sentinel, tag_sentinel);
+
+        // We only have 1 suggestion
+        let sug = ProcessedSuggestion::new("sug1", "", "");
+        let builder = ActiveSuggestionsBuilder {
+            processed: vec![sug],
+            unprocessed: std::collections::VecDeque::new(),
+            common_prefix: None,
+            auto_accept_if_solo: false,
+            insert_common_prefix: false,
+            comp_type: crate::tab_completion_context::CompType::FirstWord,
+            nosort: false,
+            compspec_was_useful: true,
+        };
+
+        let mut active = ActiveSuggestions::new(
+            builder,
+            crate::text_buffer::SubString::new("", "").unwrap(),
+            std::time::Duration::from_millis(0),
+            true, // auto_started
+            crate::settings::SuggestionSortOrder::default(),
+        );
+
+        // Render auto suggestions. Since y = 0, the suggestions box should take:
+        // - y = 0: top border
+        // - y = 1: inner rows (1 item -> 1 row)
+        // - y = 2: bottom border
+        // - y = 3: cursor newline moved here
+        // Row 6 (index 6) is well below the bottom of the box and should remain untouched!
+        App::render_auto_suggestions(
+            &settings,
+            &mut active,
+            &mut content,
+            40,               // width
+            20,               // rows_left_before_end_of_screen
+            None,             // cursor_pos_maybe
+            "",               // buffer
+            0,                // cursor_byte_pos
+            Style::default(), // scrollbar_style
+        );
+
+        assert_eq!(
+            content.get_buffer_lines(),
+            vec![
+                "                                        ".to_string(),
+                "╭──────────────────╮                    ".to_string(),
+                "│sug1              │                    ".to_string(),
+                "╰─ Pos: -/1; 0.0ms─╯                    ".to_string(),
+                "                                        ".to_string(),
+                "                                        ".to_string(),
+                "     X                                  ".to_string(),
+                "                                        ".to_string(),
+                "                                        ".to_string(),
+                "                                        ".to_string(),
+            ]
+        );
+
+        // Verify that row 6 cell at index 5 still contains our sentinel "X"
+        let cell = &content.buf[6][5];
+        assert_eq!(cell.cell.symbol(), "X");
+        assert_eq!(cell.tag, tag_sentinel);
     }
 }

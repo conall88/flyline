@@ -197,6 +197,7 @@ pub enum Tag {
     MultiWidthContinuation,
     FlycompYes,
     FlycompNo,
+    FlycompDontAsk,
     FlycompSandboxInfo,
     FlycompInfo,
     RightClickCopy,
@@ -290,6 +291,21 @@ impl Contents {
 
     pub fn height(&self) -> u16 {
         self.buf.len() as u16
+    }
+
+    #[cfg(test)]
+    pub fn get_buffer_lines(&self) -> Vec<String> {
+        self.buf
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|c| {
+                        let sym = c.cell.symbol();
+                        if sym.is_empty() { " " } else { sym }
+                    })
+                    .collect::<String>()
+            })
+            .collect()
     }
 
     pub fn move_to_next_insertion_point(
@@ -1021,7 +1037,9 @@ impl Contents {
     pub fn draw_menu(
         &mut self,
         entries: &[(&str, Tag)],
+        extra_entries: &[(&str, Tag)],
         selected_tag: Option<Tag>,
+        is_left_button_down: bool,
         y_start: u16,
         x_start: u16,
         max_height: u16,
@@ -1033,16 +1051,16 @@ impl Contents {
         let max_width = entries
             .iter()
             .map(|(s, _)| s.len())
+            .chain(extra_entries.iter().map(|(s, _)| s.len()))
             .chain(info_lines.iter().map(|s| s.len()))
             .max()
             .unwrap_or(0);
         let popup_width = (max_width + 2) as u16; // 1 space padding on left, 1 space padding on right
+        let has_separator = !extra_entries.is_empty() || !info_lines.is_empty();
         let popup_height = (entries.len()
-            + if info_lines.is_empty() {
-                0
-            } else {
-                info_lines.len() + 1
-            }) as u16;
+            + extra_entries.len()
+            + if has_separator { 1 } else { 0 }
+            + info_lines.len()) as u16;
 
         let y = y_start.min(max_height.saturating_sub(popup_height));
         let x = x_start.min(self.width.saturating_sub(popup_width));
@@ -1061,7 +1079,15 @@ impl Contents {
             self.move_cursor_to(row, x);
 
             let is_selected = selected_tag == Some(*tag);
-            let entry_style = if is_selected { selected_style } else { style };
+            let entry_style = if is_selected {
+                if is_left_button_down {
+                    Palette::apply_button_style(style, ButtonState::Depressed)
+                } else {
+                    selected_style
+                }
+            } else {
+                style
+            };
 
             let padded_text = format!(" {:width$} ", text, width = max_width);
             self.write_tagged_span(&TaggedSpan::new(
@@ -1070,8 +1096,8 @@ impl Contents {
             ));
         }
 
-        if !info_lines.is_empty() {
-            let sep_row = y + entries.len() as u16;
+        let sep_row = y + entries.len() as u16;
+        if has_separator {
             self.move_cursor_to(sep_row, x);
             if let Some(row) = self.buf.get_mut(sep_row as usize) {
                 for col in x..(x + popup_width) {
@@ -1082,17 +1108,40 @@ impl Contents {
                     }
                 }
             }
+        }
 
-            for (i, line) in info_lines.iter().enumerate() {
-                let row = sep_row + 1 + i as u16;
-                self.move_cursor_to(row, x);
+        for (i, (text, tag)) in extra_entries.iter().enumerate() {
+            let row = sep_row + 1 + i as u16;
+            self.move_cursor_to(row, x);
 
-                let padded_line = format!(" {:width$} ", line, width = max_width);
-                self.write_tagged_span(&TaggedSpan::new(
-                    Span::styled(padded_line, secondary_style),
-                    Tag::RightClickMenu,
-                ));
-            }
+            let is_selected = selected_tag == Some(*tag);
+            let entry_style = if is_selected {
+                if is_left_button_down {
+                    Palette::apply_button_style(style, ButtonState::Depressed)
+                } else {
+                    selected_style
+                }
+            } else {
+                style
+            };
+
+            let padded_text = format!(" {:width$} ", text, width = max_width);
+            self.write_tagged_span(&TaggedSpan::new(
+                Span::styled(padded_text, entry_style),
+                *tag,
+            ));
+        }
+
+        let info_start_row = sep_row + 1 + extra_entries.len() as u16;
+        for (i, line) in info_lines.iter().enumerate() {
+            let row = info_start_row + i as u16;
+            self.move_cursor_to(row, x);
+
+            let padded_line = format!(" {:width$} ", line, width = max_width);
+            self.write_tagged_span(&TaggedSpan::new(
+                Span::styled(padded_line, secondary_style),
+                Tag::RightClickMenu,
+            ));
         }
     }
 
@@ -1530,7 +1579,9 @@ mod tests {
         ];
         contents.draw_menu(
             &entries,
+            &[],
             None,
+            false,
             1,
             5,
             15,
@@ -1540,40 +1591,20 @@ mod tests {
             Style::default(),
         );
 
-        let y = 1;
-        let x = 5; // 5.min(40 - 35) = 5 (popup_width is max_width 33 + 2 = 35)
-        assert_eq!(contents.buf[y as usize][x as usize].cell.symbol(), " ");
-        let row1: String = contents.buf[y as usize]
-            .iter()
-            .map(|c| c.cell.symbol())
-            .collect();
-        assert!(row1.contains("Copy"));
-        let row2: String = contents.buf[(y + 1) as usize]
-            .iter()
-            .map(|c| c.cell.symbol())
-            .collect();
-        assert!(row2.contains("Cut"));
-        let row3: String = contents.buf[(y + 2) as usize]
-            .iter()
-            .map(|c| c.cell.symbol())
-            .collect();
-        assert!(row3.contains("Paste"));
-        let row4: String = contents.buf[(y + 3) as usize]
-            .iter()
-            .map(|c| c.cell.symbol())
-            .collect();
-        assert!(!row4.contains("├"));
-        assert!(row4.contains("─"));
-        assert!(!row4.contains("┤"));
-        let row5: String = contents.buf[(y + 4) as usize]
-            .iter()
-            .map(|c| c.cell.symbol())
-            .collect();
-        assert!(row5.contains("Flyline captures mouse input."));
-        let row6: String = contents.buf[(y + 5) as usize]
-            .iter()
-            .map(|c| c.cell.symbol())
-            .collect();
-        assert!(row6.contains("Toggle mouse capture with Escape."));
+        assert_eq!(
+            contents.get_buffer_lines(),
+            vec![
+                "                                        ".to_string(),
+                "      Copy                              ".to_string(),
+                "      Cut                               ".to_string(),
+                "      Paste                             ".to_string(),
+                "     ───────────────────────────────────".to_string(),
+                "      Flyline captures mouse input.     ".to_string(),
+                "      Toggle mouse capture with Escape. ".to_string(),
+                "                                        ".to_string(),
+                "                                        ".to_string(),
+                "                                        ".to_string(),
+            ]
+        );
     }
 }

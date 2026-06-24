@@ -7,7 +7,7 @@ use crate::active_suggestions::{
     ActiveSuggestions, ActiveSuggestionsBuilder, ProcessedSuggestion, SuggestionDescription,
     UnprocessedSuggestion,
 };
-use crate::app::{App, ContentMode, TabCompletionHandle};
+use crate::app::{App, ContentMode, FlycompPromptSelection, TabCompletionHandle};
 use crate::bash_funcs::{self, QuoteType};
 use crate::content_utils::{self, ansi_string_to_spans};
 use crate::globbing::PathPatternExpansion;
@@ -92,18 +92,6 @@ fn run_comp_spec_completion(
 
         match poss_completions {
             Ok(comp_result) => {
-                if !comp_result.compspec_was_useful {
-                    log::info!(
-                        "run_comp_spec_completion: compspec for '{}' was not useful",
-                        alias_expanded_command_word
-                    );
-                    if !auto_started {
-                        let mut builder = ActiveSuggestionsBuilder::new();
-                        builder.compspec_was_useful = false;
-                        return Some(builder);
-                    }
-                    return None;
-                }
                 log::debug!(
                     "Programmable completion results for command: {}",
                     alias_expanded_full_command
@@ -122,7 +110,8 @@ fn run_comp_spec_completion(
                                 word_under_cursor: alias_expanded_word_under_cursor.to_string(),
                             }),
                     )
-                    .with_nosort(flags.nosort_desired),
+                    .with_nosort(flags.nosort_desired)
+                    .with_compspec_was_useful(comp_result.compspec_was_useful),
                 )
             }
             _ => None,
@@ -294,7 +283,7 @@ fn gen_completions_uncomitted(
                         builder.len(),
                         initial_command_word
                     );
-                    if !builder.compspec_was_useful || !builder.is_empty() {
+                    if !builder.is_empty() {
                         return Some(builder.with_comp_type(comp_type.clone()));
                     }
                 }
@@ -321,9 +310,6 @@ fn gen_completions_uncomitted(
                     initial_command_word,
                     auto_started,
                 ) {
-                    if !builder.compspec_was_useful {
-                        return Some(builder.with_comp_type(comp_type.clone()));
-                    }
                     let matcher = ArinaeMatcher::new(skim::CaseMatching::Smart, true);
                     let pattern = original_wuc.strip_prefix(&new_wuc).unwrap_or(original_wuc);
 
@@ -1090,23 +1076,24 @@ impl App<'_> {
         load_time: std::time::Duration,
         auto_started: bool,
     ) {
+        let completion_context = tab_completion_context::get_completion_context(
+            self.buffer.buffer(),
+            self.buffer.cursor_byte_pos(),
+        );
+        let command_word = completion_context
+            .context
+            .as_ref()
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string();
+
         if self.settings.use_flycomp
+            && !self.settings.flycomp_blacklist.contains(&command_word)
             && !builder.compspec_was_useful
             && !auto_started
             && (wuc_substring.s.is_empty() || wuc_substring.s.chars().all(|c| c == '-'))
         {
-            let completion_context = tab_completion_context::get_completion_context(
-                self.buffer.buffer(),
-                self.buffer.cursor_byte_pos(),
-            );
-            let command_word = completion_context
-                .context
-                .as_ref()
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .to_string();
-
             let output_dir = self.settings.flycomp_output.as_deref();
             let dump_path =
                 crate::bash_funcs::resolve_completion_script_path(&command_word, output_dir)
@@ -1117,7 +1104,7 @@ impl App<'_> {
             self.content_mode = ContentMode::TabCompletionAskForFlycomp {
                 command_word,
                 word_under_cursor: wuc_substring.s.clone(),
-                selected_yes: true,
+                selection: FlycompPromptSelection::Yes,
                 sandbox,
                 dump_path,
             };
@@ -1179,6 +1166,8 @@ impl App<'_> {
         {
             drop(handle);
         }
+
+        self.dismissed_tab_completion_wuc = None;
 
         // Phase 1: compute the completion context and generate suggestions.
         // We store word_under_cursor as an owned SubString so we can use it
@@ -1275,24 +1264,42 @@ impl App<'_> {
             let thread_handle = std::thread::spawn(move || {
                 let mut file = unsafe { std::fs::File::from_raw_fd(read_fd) };
                 let mut len_buf = [0u8; 8];
-                if std::io::Read::read_exact(&mut file, &mut len_buf).is_err() {
-                    let _ = tx.send(None);
+                let res = if std::io::Read::read_exact(&mut file, &mut len_buf).is_err() {
+                    None
                 } else {
                     let len = u64::from_ne_bytes(len_buf);
                     let mut data_buf = vec![0u8; len as usize];
                     if std::io::Read::read_exact(&mut file, &mut data_buf).is_ok() {
-                        let result: Option<(ActiveSuggestionsBuilder, std::time::Duration)> =
-                            serde_json::from_slice(&data_buf).ok().flatten();
-                        let _ = tx.send(result);
+                        serde_json::from_slice(&data_buf).ok().flatten()
                     } else {
-                        let _ = tx.send(None);
+                        None
                     }
+                };
+                let _ = tx.send(res);
+
+                // Reap the child process to prevent zombie processes
+                unsafe {
+                    let mut status = 0;
+                    libc::waitpid(pid, &mut status, 0);
+                    log::info!(
+                        "Tab completion process (pid {}) reaped in reader thread",
+                        pid
+                    );
                 }
             });
 
+            crate::threads::register_thread(
+                crate::threads::ThreadTag::TabCompletion,
+                thread_handle,
+            );
+
             // Block for some time waiting for the process to finish.
-            // Block for at most 10ms to avoid blocking the main thread.
-            let timeout = std::time::Duration::from_millis(10);
+            // Block for at most 10ms (or 1ms for auto-started completion) to avoid blocking the main thread.
+            let timeout = if auto_started {
+                std::time::Duration::from_millis(1)
+            } else {
+                std::time::Duration::from_millis(10)
+            };
 
             match rx.recv_timeout(timeout) {
                 Ok(Some((builder, elapsed))) => {
@@ -1313,7 +1320,6 @@ impl App<'_> {
                         handle: TabCompletionHandle {
                             receiver: rx,
                             pid: Some(pid),
-                            thread_handle: Some(thread_handle),
                         },
                         wuc_substring,
                         start_time,
@@ -1493,6 +1499,36 @@ mod tab_completion_tests {
             let actual = run_completion("ssh us@localho");
             let names: Vec<&str> = actual.iter().map(|s| s.s.as_str()).collect();
             assert_eq!(names, vec!["us@localhost"]);
+        }
+
+        #[test]
+        fn test_tilde_dot_completions() {
+            let temp_home = std::env::temp_dir().join(format!("flyline_test_home_{}", rand::random::<u32>()));
+            std::fs::create_dir_all(&temp_home).unwrap();
+            unsafe { std::env::set_var("FLYLINE_TEST_HOME", temp_home.to_str().unwrap()); }
+
+            let test_dot_file = temp_home.join(".test_dot_file");
+            std::fs::write(&test_dot_file, "").unwrap();
+
+            let test_file = temp_home.join("file with spaces.txt");
+            std::fs::write(&test_file, "").unwrap();
+
+            let test_dir = temp_home.join("foo");
+            std::fs::create_dir(&test_dir).unwrap();
+
+            cd_to_example_fs();
+
+            let actual = run_completion("ll ~/.");
+            let names: Vec<&str> = actual.iter().map(|s| s.s.as_str()).collect();
+            println!("tilde dot names: {:?}", names);
+            assert_eq!(names, vec![".test_dot_file"]);
+
+            let actual_f = run_completion("ll ~/f");
+            let names_f: Vec<&str> = actual_f.iter().map(|s| s.s.as_str()).collect();
+            println!("tilde f names: {:?}", names_f);
+            assert_eq!(names_f, vec!["file\\ with\\ spaces.txt", "foo/"]);
+
+            let _ = std::fs::remove_dir_all(temp_home);
         }
 
         #[test]
