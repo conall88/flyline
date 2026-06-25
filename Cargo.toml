@@ -1,6 +1,6 @@
 [package]
 name = "flyline"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 
 
@@ -42,7 +42,7 @@ parse-style = { version = "0.4.0" }
 easing-function = "0.1.1"
 strum = { version = "0.28.0", features = ["derive"] }
 ctor = "0.10.0"
-flycomp = { git = "https://github.com/HalFrgrd/flycomp.git", rev = "d7c565e5a5e817cfe398c1be947b98baa5af1077" }
+flycomp = { git = "https://github.com/HalFrgrd/flycomp.git", rev = "29813f47d0f733273ccfb03df72a33639b85902e" }
 
 [features]
 pre_bash_4_4 = []

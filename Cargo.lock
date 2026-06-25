@@ -617,8 +617,8 @@ dependencies = [
 
 [[package]]
 name = "flycomp"
-version = "1.0.0"
-source = "git+https://github.com/HalFrgrd/flycomp.git?rev=d7c565e5a5e817cfe398c1be947b98baa5af1077#d7c565e5a5e817cfe398c1be947b98baa5af1077"
+version = "1.1.0"
+source = "git+https://github.com/HalFrgrd/flycomp.git?rev=29813f47d0f733273ccfb03df72a33639b85902e#29813f47d0f733273ccfb03df72a33639b85902e"
 dependencies = [
  "anyhow",
  "chrono",
@@ -635,7 +635,7 @@ dependencies = [
 
 [[package]]
 name = "flyline"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
