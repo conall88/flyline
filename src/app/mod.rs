@@ -44,10 +44,10 @@ use crate::mouse_state::{MouseState, PointerShape, XtShiftEscape};
 use crate::palette::{ButtonState, Palette};
 use crate::prompt_manager::PromptManager;
 use crate::settings::{self, MatrixAnimation, MouseMode, Settings};
+use crate::shell_integration;
 use crate::text_buffer::{SubString, TextBuffer};
 use crate::{bash_funcs, dparser};
 use crate::{bash_symbols, command_acceptance};
-use crate::{shell_integration, tab_completion_context};
 use crossterm::event::{
     self, Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
@@ -1195,7 +1195,7 @@ impl<'a> App<'a> {
                                         "Successfully evaluated synthesized completion script for '{}'",
                                         command_word
                                     );
-                                    self.start_tab_complete(false);
+                                    self.start_tab_complete(false, None);
                                 }
                                 Err(e) => {
                                     log::error!(
@@ -1509,128 +1509,183 @@ impl<'a> App<'a> {
             ContentMode::TabCompletion(_) | ContentMode::TabCompletionWaiting { .. }
         );
 
-        if navigated_history || self.buffer.buffer().is_empty() {
-            if is_tab_completion_active {
-                if let ContentMode::TabCompletionWaiting { handle, .. } =
-                    std::mem::replace(&mut self.content_mode, ContentMode::Normal)
-                {
-                    drop(handle);
-                } else {
-                    self.content_mode = ContentMode::Normal;
-                }
+        if self.settings.auto_suggest || is_tab_completion_active {
+            #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+            enum CompletionAction {
+                Keep,
+                // carry_over: do we want to use the current suggestions as a placeholder?
+                // if the new suggestions will be similar to the old ones, we can use them
+                // while the new ones load to avoid a flicker of no suggestions.
+                Restart { carry_over: bool },
+                Discard,
+                Update,
             }
-            self.dismissed_tab_completion_wuc = None;
-        } else if self.settings.auto_suggest || is_tab_completion_active {
-            let new_wuc = {
-                let buffer: &str = self.buffer.buffer();
-                tab_completion_context::get_completion_context(
-                    buffer,
-                    self.buffer.cursor_byte_pos(),
-                )
-                .word_under_cursor
+
+            let get_action = |app: &Self, new_wuc: &SubString| -> Option<CompletionAction> {
+                app.mouse_state.is_left_button_down()
+                    // If we're dragging the mouse, we dont want to change anything
+                    .then_some(CompletionAction::Keep)
+                    // pressing up and down when navigating history. so dont let suggestions get in the way
+                    .or_else(|| {
+                        (navigated_history || app.buffer.buffer().is_empty())
+                            .then_some(CompletionAction::Discard)
+                    })
+                    // If we have dismissed suggestions for this wuc, keep them dismissed
+                    .or_else(|| {
+                        let is_wuc_identical =
+                            app.dismissed_tab_completion_wuc.as_deref() == Some(new_wuc.s.as_str());
+                        is_wuc_identical.then_some(CompletionAction::Keep)
+                    })
+                    // restart auto tab completion if the last key was a trigger character
+                    // typing / when completing a path should restart completions so we can tab complete the next folder
+                    // typing - often starts the `--flag` style completions instead of default filename completions, so we want to restart completions when typing -
+                    // similar ideas for other trigger chars
+                    .or_else(|| {
+                        let is_tab_completion_auto_started = match &app.content_mode {
+                            ContentMode::TabCompletionWaiting { auto_started, .. } => *auto_started,
+                            ContentMode::TabCompletion(active_suggestions) => active_suggestions.auto_started,
+                            _ => false,
+                        };
+
+                        let is_trigger_active = is_tab_completion_auto_started
+                            && matches!(
+                                app.content_mode,
+                                ContentMode::Normal
+                                    | ContentMode::TabCompletionWaiting { .. }
+                                    | ContentMode::TabCompletion(_)
+                            );
+
+                        if is_trigger_active {
+                            let last_char_is_trigger = is_fresh
+                                .then(|| app.last_key.as_ref())
+                                .flatten()
+                                .and_then(|k| match k.key.code {
+                                    KeyCode::Char(c)
+                                        if !k
+                                            .key
+                                            .modifiers
+                                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                                    {
+                                        let is_trigger = c == '/'
+                                            || c == '$'
+                                            || c == '~'
+                                            || c == '.'
+                                            || c == '+'
+                                            || c == '='
+                                            || (c == '-' && new_wuc.s.chars().all(|ch| ch == '-'));
+                                        is_trigger.then_some(c)
+                                    }
+                                    _ => None,
+                                });
+
+                            last_char_is_trigger.map(|c| {
+                                let carry_over = c == '-' || c == '.';
+                                CompletionAction::Restart { carry_over }
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    // Lets get the auto suggestionns going!
+                    .or_else(|| {
+                        (app.settings.auto_suggest && matches!(app.content_mode, ContentMode::Normal))
+                            .then_some(CompletionAction::Restart { carry_over: false })
+                    })
+                    // This block is more about refining the tab completions when active and knowing when to discard them (e.g. moved cursor to another word)
+                    .or_else(|| {
+                        match &app.content_mode {
+                            ContentMode::TabCompletionWaiting {
+                                wuc_substring,
+                                auto_started,
+                                ..
+                            } => {
+                                let old_wuc = &wuc_substring.s;
+                                if *auto_started && new_wuc.s.chars().count() < old_wuc.chars().count() {
+                                    log::debug!(
+                                        "Word under cursor became shorter than waiting wuc ('{}' -> '{}') during automatic tab completion",
+                                        old_wuc,
+                                        new_wuc.s
+                                    );
+                                    Some(CompletionAction::Restart { carry_over: true })
+                                } else if !new_wuc.s.starts_with(old_wuc)
+                                    && !old_wuc.starts_with(&new_wuc.s)
+                                {
+                                    if app.settings.auto_suggest {
+                                        Some(CompletionAction::Restart { carry_over: false })
+                                    } else {
+                                        Some(CompletionAction::Discard)
+                                    }
+                                } else {
+                                    None
+                                }
+                            }
+                            ContentMode::TabCompletion(active_suggestions) => {
+                                let orig_wuc = &active_suggestions.original_word_under_cursor.s;
+                                let current_wuc = &active_suggestions.word_under_cursor;
+
+                                if active_suggestions.auto_started
+                                    && new_wuc.s.chars().count() < orig_wuc.chars().count()
+                                {
+                                    log::debug!(
+                                        "Word under cursor became shorter than original wuc ('{}' -> '{}')",
+                                        orig_wuc,
+                                        new_wuc.s
+                                    );
+                                    Some(CompletionAction::Restart { carry_over: true })
+                                } else if *new_wuc == *current_wuc {
+                                    log::debug!(
+                                        "Word under cursor unchanged ('{:?}'), keeping existing tab completion suggestions",
+                                        new_wuc
+                                    );
+                                    Some(CompletionAction::Keep)
+                                } else if new_wuc.s.is_empty() && !orig_wuc.is_empty() {
+                                    log::debug!(
+                                        "Word under cursor cleared, discarding tab completion suggestions"
+                                    );
+                                    Some(CompletionAction::Discard)
+                                } else if new_wuc.overlaps_with(current_wuc) {
+                                    let old_len = current_wuc.s.chars().count();
+                                    let new_len = new_wuc.s.chars().count();
+                                    if old_len.abs_diff(new_len) > 1 {
+                                        log::debug!(
+                                            "Word under cursor changed slightly but by multiple characters ('{}' -> '{}')",
+                                            current_wuc.s,
+                                            new_wuc.s
+                                        );
+                                        Some(CompletionAction::Restart { carry_over: true })
+                                    } else {
+                                        Some(CompletionAction::Update)
+                                    }
+                                } else {
+                                    log::debug!(
+                                        "Word under cursor changed significantly ('{:?}' -> '{:?}'), discarding tab completion suggestions",
+                                        current_wuc,
+                                        new_wuc
+                                    );
+                                    if app.settings.auto_suggest {
+                                        Some(CompletionAction::Restart { carry_over: false })
+                                    } else {
+                                        Some(CompletionAction::Discard)
+                                    }
+                                }
+                            }
+                            _ => None,
+                        }
+                    })
             };
 
-            let last_char_is_trigger = is_fresh
-                && if let Some(last_key) = &self.last_key {
-                    if let KeyCode::Char(c) = last_key.key.code {
-                        let mods_satisfied = !last_key
-                            .key
-                            .modifiers
-                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+            let new_wuc = self.completion_context().word_under_cursor;
+            let action = get_action(self, &new_wuc).unwrap_or(CompletionAction::Keep);
 
-                        (c == '/'
-                            || c == '$'
-                            || c == '~'
-                            || c == '.'
-                            || c == '+'
-                            || c == '='
-                            || (c == '-' && new_wuc.s.chars().all(|ch| ch == '-')))
-                            && mods_satisfied
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-
-            if last_char_is_trigger
-                && matches!(
-                    self.content_mode,
-                    ContentMode::Normal
-                        | ContentMode::TabCompletionWaiting { .. }
-                        | ContentMode::TabCompletion(_)
-                )
-            {
-                self.content_mode = ContentMode::Normal;
-                self.dismissed_tab_completion_wuc = None;
-            }
-
-            let mut restart_auto_completion = false;
-
-            // Cancel a pending tab-completion background thread when the word under
-            // cursor has changed in a way that invalidates the in-flight completion.
-            // Keep waiting if the new word is a prefix of the old one or vice-versa
-            // (the user is just typing more characters or deleting some).
-            if let ContentMode::TabCompletionWaiting {
-                ref wuc_substring,
-                auto_started,
-                ..
-            } = self.content_mode
-            {
-                let old_wuc = &wuc_substring.s;
-                if auto_started && new_wuc.s.chars().count() < old_wuc.chars().count() {
-                    log::debug!(
-                        "Word under cursor became shorter than waiting wuc ('{}' < '{}') during automatic tab completion, restarting",
-                        new_wuc.s,
-                        old_wuc
-                    );
-                    restart_auto_completion = true;
-                } else if !new_wuc.s.starts_with(old_wuc.as_str())
-                    && !old_wuc.starts_with(&new_wuc.s)
-                {
-                    self.content_mode = ContentMode::Normal;
+            match action {
+                CompletionAction::Keep => {}
+                CompletionAction::Discard => {
+                    self.take_active_suggestions();
+                    self.dismissed_tab_completion_wuc = None;
                 }
-            }
-
-            // Apply fuzzy filtering to active tab completion suggestions
-            if let ContentMode::TabCompletion(active_suggestions) = &mut self.content_mode {
-                if active_suggestions.auto_started
-                    && new_wuc.s.chars().count()
-                        < active_suggestions
-                            .original_word_under_cursor
-                            .s
-                            .chars()
-                            .count()
-                {
-                    log::debug!(
-                        "Word under cursor became shorter than original wuc ('{}' < '{}'), restarting automatic tab completion",
-                        new_wuc.s,
-                        active_suggestions.original_word_under_cursor.s
-                    );
-                    restart_auto_completion = true;
-                } else if new_wuc == active_suggestions.word_under_cursor {
-                    // No change to the word under cursor; keep the same suggestions.
-                    log::debug!(
-                        "Word under cursor unchanged ('{:?}'), keeping existing tab completion suggestions",
-                        new_wuc
-                    );
-                } else if new_wuc.s.is_empty()
-                    && !active_suggestions.original_word_under_cursor.s.is_empty()
-                {
-                    log::debug!("Word under cursor cleared, discarding tab completion suggestions",);
-                    // If the word under cursor is cleared, discard suggestions
-                    self.content_mode = ContentMode::Normal;
-                } else if new_wuc.overlaps_with(&active_suggestions.word_under_cursor) {
-                    let old_char_count = active_suggestions.word_under_cursor.s.chars().count();
-                    let new_char_count = new_wuc.s.chars().count();
-                    if old_char_count.abs_diff(new_char_count) > 1 {
-                        log::debug!(
-                            "Word under cursor changed slightly but by multiple characters ('{}' -> '{}'), restarting automatic tab completion",
-                            active_suggestions.word_under_cursor.s,
-                            new_wuc.s
-                        );
-                        restart_auto_completion = true;
-                    } else {
+                CompletionAction::Update => {
+                    self.dismissed_tab_completion_wuc = None;
+                    if let ContentMode::TabCompletion(active_suggestions) = &mut self.content_mode {
                         log::debug!(
                             "Word under cursor changed slightly ('{}' -> '{}'), applying fuzzy filter to tab completion suggestions",
                             active_suggestions.word_under_cursor.s,
@@ -1638,43 +1693,19 @@ impl<'a> App<'a> {
                         );
                         active_suggestions.update_word_under_cursor(&new_wuc);
                     }
-                } else {
-                    log::debug!(
-                        "Word under cursor changed significantly ('{:?}' -> '{:?}'), discarding tab completion suggestions",
-                        active_suggestions.word_under_cursor,
-                        new_wuc
+                }
+                CompletionAction::Restart { carry_over } => {
+                    self.dismissed_tab_completion_wuc = None;
+                    let previous_suggestions = self.take_active_suggestions();
+                    self.start_tab_complete(
+                        true,
+                        if carry_over {
+                            previous_suggestions
+                        } else {
+                            None
+                        },
                     );
-                    // If the word under cursor has changed significantly, discard suggestions
-                    self.content_mode = ContentMode::Normal;
                 }
-            }
-
-            if restart_auto_completion && !self.mouse_state.is_left_button_down() {
-                self.start_tab_complete(true);
-            }
-
-            // Evaluate the word-under-cursor once to avoid borrow checker issues.
-            let new_wuc_s = new_wuc.s.to_string();
-
-            if self.settings.auto_suggest && matches!(self.content_mode, ContentMode::Normal) {
-                // Only auto-suggest if the word-under-cursor differs from the word the user
-                // just dismissed by pressing Escape. This prevents re-triggering on the same word.
-                let should_auto_suggest = match &self.dismissed_tab_completion_wuc {
-                    None => true,
-                    Some(dismissed_wuc) => dismissed_wuc != &new_wuc_s,
-                };
-
-                if should_auto_suggest && !self.mouse_state.is_left_button_down() {
-                    self.start_tab_complete(true);
-                }
-            }
-
-            // If the word-under-cursor has changed since the user dismissed tab completion, re-enable auto-suggest.
-            if match &self.dismissed_tab_completion_wuc {
-                None => false,
-                Some(dismissed_wuc) => dismissed_wuc != &new_wuc_s,
-            } {
-                self.dismissed_tab_completion_wuc = None;
             }
         }
 
