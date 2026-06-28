@@ -50,9 +50,7 @@ jobs:
           - { target: aarch64-unknown-linux-musl, os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
           # Additional Linux architectures
           - { target: armv7-unknown-linux-gnueabihf,  os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
-          - { target: armv7-unknown-linux-musleabihf, os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
           - { target: i686-unknown-linux-gnu,         os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
-          - { target: i686-unknown-linux-musl,        os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
           - { target: riscv64gc-unknown-linux-gnu,    os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
           - { target: powerpc64le-unknown-linux-gnu,  os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
           # Linux pre_bash_4_4

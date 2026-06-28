@@ -257,7 +257,7 @@ pub static mut flyline_struct: bash_symbols::BashBuiltin = bash_symbols::BashBui
 // is initialised as soon as the library is loaded via `enable -f`.
 // On newer versions of bash `flyline_builtin_load` is called automatically by bash during enable.
 #[cfg(feature = "pre_bash_4_4")]
-#[ctor]
+#[ctor(unsafe)]
 fn flyline_builtin_load_ctor() {
     let _ = flyline_load_common();
 }
