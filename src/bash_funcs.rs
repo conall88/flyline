@@ -1834,6 +1834,7 @@ pub fn read_terminating_signal() -> c_int {
 }
 
 #[cfg(not(test))]
+#[allow(dead_code)]
 pub fn set_env_var(name: &str, value: &str) -> Result<()> {
     unsafe {
         let name_cstr = std::ffi::CString::new(name)?;
@@ -1850,9 +1851,34 @@ pub fn set_env_var(name: &str, value: &str) -> Result<()> {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub fn set_env_var(name: &str, value: &str) -> Result<()> {
     // SAFETY: Tests that mutate process env vars run inside `rusty_fork_test!`
     // forked subprocesses, so the mutation cannot race with other threads.
+    unsafe { std::env::set_var(name, value) };
+    Ok(())
+}
+
+#[cfg(not(test))]
+pub fn export_env_var(name: &str, value: &str) -> Result<()> {
+    unsafe {
+        let name_cstr = std::ffi::CString::new(name)?;
+        let value_cstr = std::ffi::CString::new(value)?;
+        let var = bash_symbols::bind_variable(name_cstr.as_ptr(), value_cstr.as_ptr(), 0);
+        if var.is_null() {
+            return Err(anyhow::anyhow!(
+                "Failed to export environment variable '{}'",
+                name
+            ));
+        }
+        (*var).attributes |= 0x0000001; // att_exported
+        bash_symbols::array_needs_making = 1;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+pub fn export_env_var(name: &str, value: &str) -> Result<()> {
     unsafe { std::env::set_var(name, value) };
     Ok(())
 }

@@ -1,11 +1,25 @@
 #!/bin/sh
 # Flyline installer
-# Usage: curl -sSfL https://raw.githubusercontent.com/HalFrgrd/flyline/master/install.sh | sh
+# Usage: curl -sSfL https://github.com/HalFrgrd/flyline/releases/latest/download/install.sh | sh
 
 set -eu
 
+expand_path() {
+    case "$1" in
+        '~/'*) echo "${HOME}/${1#~/}" ;;
+        '~')   echo "${HOME}" ;;
+        *)     echo "$1" ;;
+    esac
+}
+
 REPO="HalFrgrd/flyline"
-INSTALL_DIR="${HOME}/.local/lib"
+if [ -n "${FLYLINE_INSTALL_DIR:-}" ]; then
+    INSTALL_DIR="$(expand_path "$FLYLINE_INSTALL_DIR")"
+elif [ -n "${FLYLINE_LOAD_DIR:-}" ]; then
+    INSTALL_DIR="$(expand_path "$FLYLINE_LOAD_DIR")"
+else
+    INSTALL_DIR="${HOME}/.local/lib"
+fi
 BASHRC="${HOME}/.bashrc"
 
 # ---------------------------------------------------------------------------
@@ -193,9 +207,9 @@ main() {
 
     say "Detected target: ${TARGET}"
 
-    if [ -n "${FLYLINE_RELEASE_VERSION:-}" ]; then
-        say "Using specified release version: ${FLYLINE_RELEASE_VERSION}"
-        VERSION="${FLYLINE_RELEASE_VERSION}"
+    if [ -n "${FLYLINE_INSTALL_VERSION:-}" ]; then
+        say "Using specified release version: ${FLYLINE_INSTALL_VERSION}"
+        VERSION="${FLYLINE_INSTALL_VERSION}"
     else
         say "Fetching latest release information..."
         VERSION="$(get_latest_version)"
@@ -220,7 +234,8 @@ main() {
     # shellcheck disable=SC2064
     trap "rm -rf '$TMP_DIR'" EXIT
 
-    say "Downloading ${ARCHIVE} from ${DOWNLOAD_URL}..."
+    say "Downloading ${ARCHIVE} from
+    ${DOWNLOAD_URL}..."
     download "$DOWNLOAD_URL" "${TMP_DIR}/${ARCHIVE}"
 
     if [ -n "$SHA256_URL" ]; then
@@ -233,25 +248,6 @@ main() {
             || err "Checksum verification failed for ${ARCHIVE}."
     fi
 
-    # Prompt for install directory; read from /dev/tty so it works when piped.
-    # Falls back to the default when no terminal is available (e.g. CI).
-    say "Enter install directory (leave blank to use: ~/.local/lib)"
-    printf '> ' >&2
-    input_dir=""
-    if [ -t 0 ]; then
-        read -r input_dir || true
-    elif [ -r /dev/tty ]; then
-        read -r input_dir </dev/tty || true
-    fi
-    if [ -n "$input_dir" ]; then
-        # Expand a leading ~/ to $HOME/.
-        # shellcheck disable=SC2088
-        case "$input_dir" in
-            '~/'*) input_dir="${HOME}/${input_dir#~/}" ;;
-            '~')   input_dir="${HOME}" ;;
-        esac
-        INSTALL_DIR="$input_dir"
-    fi
 
     mkdir -p "$INSTALL_DIR"
 
@@ -276,14 +272,12 @@ main() {
     say "Installed: ${LIB_PATH}"
 
     # Update or add 'enable -f ... flyline' in ~/.bashrc.
-    ENABLE_CMD="enable -f ${LIB_PATH} flyline"
-    if [ -f "$BASHRC" ] && grep -qE '^enable( -f [^ ]*)? flyline( |$)' "$BASHRC"; then
-        new_content=$(sed -E "s|^enable( -f [^ ]*)? flyline( .*)?$|${ENABLE_CMD}|" "$BASHRC")
-        printf '%s' "$new_content" > "$BASHRC"
-        say "Updated flyline configuration in ${BASHRC}"
-    else
+    if [ -z "${FLYLINE_VERSION:-}" ]; then
+        ENABLE_CMD="enable -f ${LIB_PATH} flyline"
         printf '\n# Flyline - enhanced Bash experience\n%s\n' "$ENABLE_CMD" >> "$BASHRC"
         say "Added flyline to ${BASHRC}"
+    else
+        say "Flyline is already installed (detected ${FLYLINE_VERSION}); skipping .bashrc modification."
     fi
 
 
@@ -307,11 +301,27 @@ main() {
     fi
 
     say ""
-    say "Installation complete!"
-    say '    To activate in the current shell:'
-    say "        $ENABLE_CMD"
-    say '    Or open a new terminal and run the tutorial:'
-    say "        flyline run-tutorial"
+    if [ -n "${FLYLINE_VERSION:-}" ]; then
+        say "Upgrade from ${FLYLINE_VERSION} -> ${VERSION}, run \`flyline changelog\` to see what's changed."
+        say "To activate the upgrade, open a new shell."
+        if [ -n "${FLYLINE_LOAD_DIR:-}" ]; then
+            resolved_load_dir="$(expand_path "$FLYLINE_LOAD_DIR")"
+            if [ "$resolved_load_dir" != "$INSTALL_DIR" ]; then
+                warn "The upgrade installation directory ($INSTALL_DIR) is different from the currently running load directory ($resolved_load_dir)."
+                warn "Please make sure to update your ~/.bashrc or other startup scripts to point to the new libflyline."
+            fi
+        fi
+    else
+        say "Installation complete!"
+        say '    To activate in the current shell:'
+        if [ -z "${FLYLINE_INSTALL_DIR:-}" ]; then
+            say "        $ENABLE_CMD"
+        else
+            say "        enable -d flyline && enable -f ${LIB_PATH} flyline"
+        fi
+        say '    Or open a new terminal and run the tutorial:'
+        say "        flyline run-tutorial"
+    fi
 
     # Detect if ble.sh is running or configured in ~/.bashrc
     if [ -n "${_ble_version:-}" ] || { [ -f "$BASHRC" ] && grep -q 'ble\.sh' "$BASHRC"; }; then
