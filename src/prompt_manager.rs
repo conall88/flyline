@@ -186,24 +186,6 @@ pub struct PromptManager {
     cwd: String,
 }
 
-fn get_current_readline_prompt() -> Option<String> {
-    unsafe {
-        let bash_prompt_cstr = bash_symbols::current_readline_prompt;
-        if !bash_prompt_cstr.is_null() {
-            let c_str = std::ffi::CStr::from_ptr(bash_prompt_cstr);
-            if let Ok(prompt_str) = c_str.to_str() {
-                Some(prompt_str.to_string())
-            } else {
-                log::debug!("current_readline_prompt is not valid UTF-8");
-                None
-            }
-        } else {
-            log::debug!("current_readline_prompt is null");
-            None
-        }
-    }
-}
-
 /// Pass a raw bash prompt string (with any time-code placeholders already
 /// substituted) through bash's `decode_prompt_string`, then convert the
 /// decoded output to a `Vec<Line<'static>>` via [`IntoText`].
@@ -1376,9 +1358,8 @@ impl PromptManager {
                 .with_last_app_closed_at(last_app_closed_at);
 
             // Read the raw PS1 env var so we can intercept time format codes
-            // before handing the string to decode_prompt_string.  Fall back to
-            // the already-expanded readline prompt when PS1 is not available.
-            let ps1_raw = bash_funcs::get_envvar_value("PS1").or_else(get_current_readline_prompt);
+            // before handing the string to decode_prompt_string.
+            let ps1_raw = bash_funcs::get_envvar_value("PS1");
 
             let ps1 = ps1_raw
                 .and_then(|raw| builder.expand_prompt_string(raw))
