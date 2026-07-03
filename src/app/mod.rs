@@ -826,6 +826,7 @@ impl<'a> App<'a> {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.mouse_state.set_left_button_down();
+                self.mouse_state.set_left_button_dragging(false);
                 self.mouse_state.drag_start_tag = clicked_tag;
                 if let Some(Tag::Command(byte_pos)) = clicked_tag {
                     self.mouse_state.record_left_click_down(byte_pos);
@@ -833,7 +834,11 @@ impl<'a> App<'a> {
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 self.mouse_state.set_left_button_up();
+                self.mouse_state.set_left_button_dragging(false);
                 self.mouse_state.drag_start_tag = None;
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.mouse_state.set_left_button_dragging(true);
             }
             MouseEventKind::Up(MouseButton::Right) => {
                 self.mouse_state.take_right_click_down_pos();
@@ -1253,19 +1258,20 @@ impl<'a> App<'a> {
             }
         }
         let start_time = std::time::Instant::now();
-        let shared_handle = crate::threads::spawn_thread(crate::threads::ThreadTag::Flycomp, move || {
-            unsafe {
-                libc::signal(libc::SIGCHLD, libc::SIG_DFL);
-            }
-            flycomp::generate_completion_output(
-                &cmd_word,
-                flycomp::OutputFormat::Bash,
-                flycomp::SynthesisStrategy::ManPageOrRunHelp,
-                use_sandbox, // sandbox
-                5000,        // timeout_ms
-                2,           // recurse_limit
-            )
-        });
+        let shared_handle =
+            crate::threads::spawn_thread(crate::threads::ThreadTag::Flycomp, move || {
+                unsafe {
+                    libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+                }
+                flycomp::generate_completion_output(
+                    &cmd_word,
+                    flycomp::OutputFormat::Bash,
+                    flycomp::SynthesisStrategy::ManPageOrRunHelp,
+                    use_sandbox, // sandbox
+                    5000,        // timeout_ms
+                    2,           // recurse_limit
+                )
+            });
         self.content_mode = ContentMode::TabCompletionRunningFlycomp {
             command_word,
             _word_under_cursor: word_under_cursor,
@@ -1505,9 +1511,12 @@ impl<'a> App<'a> {
             }
 
             let get_action = |app: &Self, new_wuc: &SubString| -> Option<CompletionAction> {
-                app.mouse_state.is_left_button_down()
-                    // If we're dragging the mouse, we dont want to change anything
-                    .then_some(CompletionAction::Keep)
+                None
+                    .or_else(|| {
+                        app.mouse_state.is_left_button_dragging()
+                            // If we're dragging the mouse, we dont want to have tab completions
+                            .then_some(CompletionAction::Discard)
+                    })
                     // pressing up and down when navigating history. so dont let suggestions get in the way
                     .or_else(|| {
                         (navigated_history || app.buffer.buffer().is_empty())
