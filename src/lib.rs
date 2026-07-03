@@ -180,7 +180,7 @@ impl Flyline {
             // This ensures that no background Rust threads are running or calling Bash FFI
             // functions while Bash is executing command execution C code (which is single-threaded
             // and has no locking of its own).
-            crate::threads::join_threads_by_tag(crate::threads::ThreadTag::Warming);
+            crate::threads::join_bash_func_threads();
 
             // unsafe {
             //     // This doesn't seem to be strictly necessary but yy_readline_get does it here.

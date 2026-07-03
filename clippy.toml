@@ -1,0 +1,6 @@
+disallowed-methods = [
+    # Disallow std::thread::spawn
+    "std::thread::spawn",
+    # Disallow std::thread::Builder::spawn
+    "std::thread::Builder::spawn",
+]

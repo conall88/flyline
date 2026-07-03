@@ -3,6 +3,9 @@ name = "flyline"
 version = "1.2.3"
 edition = "2024"
 
+[lints.clippy]
+disallowed_methods = "deny"
+
 
 [lib]
 crate-type = ["cdylib"]

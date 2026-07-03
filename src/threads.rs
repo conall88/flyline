@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_methods)]
+
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -6,6 +8,24 @@ pub(crate) enum ThreadTag {
     Warming,
     Flycomp,
     TabCompletion,
+}
+
+impl ThreadTag {
+    pub(crate) fn uses_bash_funcs(&self) -> bool {
+        match self {
+            ThreadTag::Warming => true,
+            ThreadTag::Flycomp => false,
+            ThreadTag::TabCompletion => false,
+        }
+    }
+
+    pub(crate) fn thread_name(&self) -> &'static str {
+        match self {
+            ThreadTag::Warming => "flyline-warming",
+            ThreadTag::Flycomp => "flyline-flycomp",
+            ThreadTag::TabCompletion => "flyline-completions",
+        }
+    }
 }
 
 pub(crate) trait Joinable: Send + Sync {
@@ -98,12 +118,23 @@ pub(crate) fn register_thread<T: Send + 'static>(
     shared
 }
 
-pub(crate) fn join_threads_by_tag(tag: ThreadTag) {
+pub(crate) fn spawn_thread<F, T>(tag: ThreadTag, f: F) -> SharedJoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let name = tag.thread_name().to_string();
+    let builder = std::thread::Builder::new().name(name);
+    let handle = builder.spawn(f).expect("Failed to spawn thread");
+    register_thread(tag, handle)
+}
+
+pub(crate) fn join_bash_func_threads() {
     let mut to_join = Vec::new();
     if let Ok(mut guard) = BACKGROUND_THREADS.lock() {
         let mut i = 0;
         while i < guard.len() {
-            if guard[i].tag == tag {
+            if guard[i].tag.uses_bash_funcs() {
                 let thread = guard.remove(i);
                 to_join.push(thread.handle);
             } else {

@@ -1237,7 +1237,7 @@ impl App<'_> {
 
         // Ensure the background warming thread has finished before we fork,
         // to prevent fork-deadlocks on inherited locked mutexes in the child process.
-        crate::threads::join_threads_by_tag(crate::threads::ThreadTag::Warming);
+        crate::threads::join_bash_func_threads();
 
         let pid = unsafe { libc::fork() };
 
@@ -1307,9 +1307,9 @@ impl App<'_> {
             }
 
             // Using a thread here makes it easier to handle polling here and in the main app loop.
-            let thread_handle = std::thread::Builder::new()
-                .name("flyline-completions".to_string())
-                .spawn(move || {
+            let _ = crate::threads::spawn_thread(
+                crate::threads::ThreadTag::TabCompletion,
+                move || {
                     let mut file = unsafe { std::fs::File::from_raw_fd(read_fd) };
                     let mut len_buf = [0u8; 8];
                     let payload: Option<(
@@ -1349,12 +1349,7 @@ impl App<'_> {
                             pid
                         );
                     }
-                })
-                .unwrap();
-
-            crate::threads::register_thread(
-                crate::threads::ThreadTag::TabCompletion,
-                thread_handle,
+                },
             );
 
             // Block for some time waiting for the process to finish.
