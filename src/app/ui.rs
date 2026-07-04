@@ -2131,6 +2131,27 @@ mod tests {
     }
 
     #[test]
+    fn test_auto_suggestions_popup_anchor_col_with_prefix() {
+        let anchor = auto_suggestions_popup_anchor_col(
+            10,
+            &SubString::from_parts("src/l", 5),
+            4,
+            "echo src/l",
+            10,
+        );
+        assert_eq!(anchor, 8);
+
+        let anchor = auto_suggestions_popup_anchor_col(
+            12,
+            &SubString::from_parts("", 19),
+            0,
+            "bind Ctrl+n always=",
+            19,
+        );
+        assert_eq!(anchor, 11);
+    }
+
+    #[test]
     fn test_render_history_entry_wrapping_and_ellipsis() {
         let palette = Palette::default();
         let mut content = Contents::new(20);

@@ -142,7 +142,7 @@ pub fn complete_flyline_args(
         })
         .collect::<Vec<_>>();
 
-    let args_os_string = relevant_tokens
+    let mut args_os_string: Vec<std::ffi::OsString> = relevant_tokens
         .iter()
         .map(|t| {
             if t.kind.is_whitespace() {
@@ -151,10 +151,27 @@ pub fn complete_flyline_args(
                 std::ffi::OsString::from(&t.value)
             }
         })
-        .chain(std::iter::once(std::ffi::OsString::from(
-            bash_funcs::dequoting_function_rust(wuc),
-        )))
-        .collect::<Vec<_>>();
+        .collect();
+
+    let dequoted_wuc = bash_funcs::dequoting_function_rust(wuc);
+    let mut opt_prefix_to_strip = None;
+
+    let merged = if let Some(last_arg) = args_os_string.last_mut() {
+        let last_str = last_arg.to_string_lossy();
+        if last_str.ends_with('=') || last_str.ends_with(':') {
+            opt_prefix_to_strip = Some(last_str.into_owned());
+            last_arg.push(&dequoted_wuc);
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if !merged {
+        args_os_string.push(std::ffi::OsString::from(dequoted_wuc));
+    }
 
     let index = args_os_string.len() - 1;
 
@@ -174,8 +191,33 @@ pub fn complete_flyline_args(
         current_dir_asdf.as_deref(),
     ) {
         Ok(candidates) => {
-            log::info!("{:#?}", candidates.iter().take(10).collect::<Vec<_>>());
-            Ok(candidates)
+            let processed_candidates = if let Some(prefix) = opt_prefix_to_strip {
+                candidates
+                    .into_iter()
+                    .map(|c| {
+                        let val = c.get_value().to_string_lossy();
+                        if val.contains("PREFIX_DELIM") {
+                            c
+                        } else if let Some(suffix) = val.strip_prefix(&prefix) {
+                            let new_val = format!("{}PREFIX_DELIM{}", prefix, suffix);
+                            let mut new_c = clap_complete::CompletionCandidate::new(new_val);
+                            if let Some(help) = c.get_help() {
+                                new_c = new_c.help(Some(help.clone()));
+                            }
+                            new_c
+                        } else {
+                            c
+                        }
+                    })
+                    .collect()
+            } else {
+                candidates
+            };
+            log::info!(
+                "{:#?}",
+                processed_candidates.iter().take(10).collect::<Vec<_>>()
+            );
+            Ok(processed_candidates)
         }
         Err(e) => {
             log::error!("Error generating bash completion: {e}");
@@ -1559,5 +1601,34 @@ mod tests {
         assert!(values.contains(&"start".to_string()));
         assert!(values.contains(&"stop".to_string()));
         assert!(values.contains(&"dump".to_string()));
+    }
+
+    #[test]
+    fn test_flyline_key_bind_completion() {
+        let raw_cmd = "flyline key bind BackTab agentModeError=";
+        let wuc = "";
+        let cursor_byte = raw_cmd.len();
+        let comps = complete_flyline_args(raw_cmd, wuc, cursor_byte).unwrap();
+        let values: Vec<String> = comps
+            .into_iter()
+            .map(|c| c.get_value().to_string_lossy().into_owned())
+            .collect();
+        assert!(!values.is_empty());
+    }
+
+    #[test]
+    fn test_flyline_option_completion() {
+        let raw_cmd = "flyline --show-animations=t";
+        let wuc = "t";
+        let cursor_byte = raw_cmd.len();
+        let comps = complete_flyline_args(raw_cmd, wuc, cursor_byte).unwrap();
+        let values: Vec<String> = comps
+            .into_iter()
+            .map(|c| c.get_value().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            values.contains(&"--show-animations=PREFIX_DELIMtrue".to_string())
+                || values.contains(&"--show-animations=PREFIX_DELIMfalse".to_string())
+        );
     }
 }

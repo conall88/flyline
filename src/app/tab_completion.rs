@@ -137,23 +137,27 @@ fn run_flyline_compspec(
             let processed: Vec<ProcessedSuggestion> = candidates
                 .into_iter()
                 .filter_map(|c| {
-                    let value = c.get_value().to_string_lossy().to_string();
-                    let value = if let Some(qt) = quote_type {
-                        bash_funcs::quoting_function_rust(&value, qt, true, false)
-                    } else {
-                        value.clone()
-                    };
+                    let raw_value = c.get_value().to_string_lossy().to_string();
+                    let (mut prefix, value) =
+                        if let Some(delim_pos) = raw_value.find("PREFIX_DELIM") {
+                            let p = raw_value[..delim_pos].to_string();
+                            let v = raw_value[delim_pos + "PREFIX_DELIM".len()..].to_string();
+                            (p, v)
+                        } else {
+                            (String::new(), raw_value)
+                        };
+                    if !word_under_cursor.starts_with(&prefix) {
+                        prefix = String::new();
+                    }
                     let (value, suffix) = if let Some(stripped) = value.strip_suffix("NO_SUFFIX") {
                         (stripped.to_string(), "")
                     } else {
                         (value, " ")
                     };
-                    let (prefix, value) = if let Some(delim_pos) = value.find("PREFIX_DELIM") {
-                        let p = value[..delim_pos].to_string();
-                        let v = value[delim_pos + "PREFIX_DELIM".len()..].to_string();
-                        (p, v)
+                    let value = if let Some(qt) = quote_type {
+                        bash_funcs::quoting_function_rust(&value, qt, true, false)
                     } else {
-                        (String::new(), value)
+                        value
                     };
 
                     let description = match c.get_help() {
