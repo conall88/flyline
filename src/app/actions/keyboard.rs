@@ -216,6 +216,10 @@ pub enum KeyEventAction {
     PromptDirMoveToEnd,
     #[strum(message = "Return to the normal command editing mode")]
     EscapeToNormalMode,
+    #[strum(message = "Activate the leader key state")]
+    SetLeaderKey,
+    #[strum(message = "Deactivate the leader key state")]
+    UnsetLeaderKey,
     #[strum(message = "Insert a literal string of characters", disabled)]
     InsertString(String),
 }
@@ -907,6 +911,12 @@ impl KeyEventAction {
 
                 app.buffer.clear_selection();
                 app.content_mode = ContentMode::Normal;
+            }
+            KeyEventAction::SetLeaderKey => {
+                app.leader_key_active_at = Some(std::time::Instant::now());
+            }
+            KeyEventAction::UnsetLeaderKey => {
+                app.leader_key_active_at = None;
             }
             KeyEventAction::InsertString(s) => {
                 app.buffer.delete_selection();
@@ -3113,6 +3123,7 @@ pub fn print_bindings_table(
 impl<'a> App<'a> {
     pub fn handle_key_event(&mut self, key: KeyEvent) {
         let _timer = crate::perf::PerfTimer::start("handle_key_event");
+        let initial_leader_time = self.leader_key_active_at;
         log::trace!("Key event: {:?}", key);
         self.right_click_popup_pos = None;
         self.right_click_copy_target = None;
@@ -3178,6 +3189,12 @@ impl<'a> App<'a> {
         {
             log::debug!("Reenabling mouse due to key event");
             self.mouse_state.enable();
+        }
+
+        // If the leader key was active before this key event, and was not refreshed or updated
+        // by a SetLeaderKey action during this key event, deactivate it now.
+        if initial_leader_time.is_some() && self.leader_key_active_at == initial_leader_time {
+            self.leader_key_active_at = None;
         }
 
         self.on_possible_buffer_change();
@@ -4097,6 +4114,8 @@ pub(crate) enum ContextVar {
     FuzzyHistorySearchNoneSelected,
     #[strum(message = "Agent output selection is active and no suggestion is currently selected")]
     AgentOutputNoneSelected,
+    #[strum(message = "The leader key is currently active")]
+    LeaderKeyActive,
 }
 
 impl ContextVar {
@@ -4229,6 +4248,9 @@ impl ContextVar {
                     false
                 }
             }
+            ContextVar::LeaderKeyActive => app.leader_key_active_at.map_or(false, |t| {
+                t.elapsed() < std::time::Duration::from_millis(1000)
+            }),
         }
     }
 }

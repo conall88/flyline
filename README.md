@@ -678,6 +678,37 @@ Q: Why would you use key event remapping?
 
 A: Instead of manually duplicating multiple context-dependent bindings from `Up` to `Ctrl+P` , you can use key event remapping to redirect `Ctrl+p` to `Up`  globally.
 
+#### Leader Keys
+
+> [!CAUTION]
+> This an experimental feature and might change. Feedback welcome
+
+Flyline supports leader key sequences. A leader key sequence allows you to press a prefix key (like `Ctrl+x`), which activates a temporary leader key state (for up to 1000ms). While that state is active, you can press a subsequent key to trigger a specific binding.
+
+To set up leader key bindings:
+```bash
+# Bind the prefix key to `setLeaderKey`**:
+flyline key bind Ctrl+x always=setLeaderKey
+
+# Ctrl+x then Ctrl+f clears the buffer, inserts "git status", and runs it
+flyline key bind Ctrl+f 'leaderKeyActive=clearBuffer+insertString(git status)+submitOrNewline'
+
+# Ctrl+x then g clears buffer, then inserts "git commit -m", and consumes the leader key
+flyline key bind g 'leaderKeyActive=clearBuffer+insertString(git commit -m)+unsetLeaderKey'
+
+# Or we could set the leader key again to chain leader key lead actions:
+flyline key bind g 'leaderKeyActive=clearBuffer+insertString(git commit -m)+setLeaderKey'
+```
+
+To show a visual indicator in your prompt (e.g. `<leader>` or ` X `) when the leader key state is active, register a `leader-mode` prompt widget:
+```bash
+# This will show "LEADER" when active and nothing inactive
+flyline create-prompt-widget leader-mode --name FLYLINE_LEADER_MODE 'LEADER' ''
+
+# And include it in your `PS1`/`RPS1`/`PS1_FILL`:
+export RPS1='FLYLINE_LEADER_MODE'
+```
+
 # Licensing
 
 This project is multi-licensed:
