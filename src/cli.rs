@@ -298,6 +298,20 @@ fn possible_effect_easing_completions(current: &std::ffi::OsStr) -> Vec<Completi
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Show version information.
+    #[command(name = "version")]
+    Version {
+        /// Copy version information to clipboard
+        #[arg(long)]
+        copy: bool,
+    },
+    /// Dump all in-memory log entries to stdout.
+    #[command(name = "dump", verbatim_doc_comment)]
+    Dump {
+        /// Only show log entries from the last duration (e.g. 5s, 2m, 1h)
+        #[arg(long)]
+        last: Option<String>,
+    },
     /// Print a timestamp.
     ///
     /// With no flags, prints nanoseconds since the Unix epoch.
@@ -701,8 +715,24 @@ enum LogSubcommands {
     ///
     /// Examples:
     ///   flyline log dump
+    ///   flyline log dump --last 5s
     #[command(name = "dump", verbatim_doc_comment)]
-    Dump,
+    Dump {
+        /// Only show log entries from the last duration (e.g. 5s, 2m, 1h)
+        #[arg(long)]
+        last: Option<String>,
+    },
+    /// Copy in-memory log entries to the clipboard.
+    ///
+    /// Examples:
+    ///   flyline log copy
+    ///   flyline log copy --last 5s
+    #[command(name = "copy", verbatim_doc_comment)]
+    Copy {
+        /// Only copy log entries from the last duration (e.g. 5s, 2m, 1h)
+        #[arg(long)]
+        last: Option<String>,
+    },
     /// Set the logging level.
     ///
     /// LEVEL is one of: error, warn, info, debug, trace
@@ -917,17 +947,8 @@ impl Flyline {
                 log::debug!("Parsed flyline arguments: {:?}", parsed);
 
                 if parsed.version {
-                    println!(
-                        "flyline version {} ({}) git:{} built:{}",
-                        env!("CARGO_PKG_VERSION"),
-                        if cfg!(debug_assertions) {
-                            "debug"
-                        } else {
-                            "release"
-                        },
-                        env!("GIT_HASH"),
-                        env!("BUILD_TIME"),
-                    );
+                    show_version(false);
+                    return bash_symbols::BuiltinExitCode::ExecutionSuccess as c_int;
                 }
 
                 if let Some(path) = parsed.load_zsh_history {
@@ -965,6 +986,30 @@ impl Flyline {
                 }
 
                 match parsed.command {
+                    Some(Commands::Version { copy }) => {
+                        show_version(copy);
+                        return bash_symbols::BuiltinExitCode::ExecutionSuccess as c_int;
+                    }
+                    Some(Commands::Dump { last }) => {
+                        use std::io::Write;
+                        match crate::logging::get_filtered_logs(last.as_deref()) {
+                            Ok(entries) => {
+                                let stdout = std::io::stdout();
+                                let mut out = stdout.lock();
+                                for entry in entries {
+                                    if let Err(e) = writeln!(out, "{}", entry) {
+                                        eprintln!("Failed to write log entry: {}", e);
+                                        return bash_symbols::BuiltinExitCode::Usage as c_int;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to retrieve logs: {}", e);
+                                return bash_symbols::BuiltinExitCode::Usage as c_int;
+                            }
+                        }
+                        return bash_symbols::BuiltinExitCode::ExecutionSuccess as c_int;
+                    }
                     Some(Commands::AgentMode {
                         system_prompt,
                         trigger_prefix,
@@ -1235,28 +1280,66 @@ impl Flyline {
                         }
                     }
                     None => {}
-                    Some(Commands::Log { subcommand }) => match subcommand {
-                        LogSubcommands::Dump => {
-                            if let Err(e) = logging::dump_logs_stdout() {
-                                eprintln!("Failed to dump logs: {}", e);
-                            }
-                        }
-                        LogSubcommands::SetLevel { level } => {
-                            let filter = log::LevelFilter::from(level);
-                            log::set_max_level(filter);
-                            log::info!("Log level set to {:?}", filter);
-                        }
-                        LogSubcommands::Stream { dest } => match logging::stream_logs(&dest) {
-                            Ok(()) => {
-                                if dest == "terminal" {
-                                    log::info!("Log streaming to terminal");
-                                } else {
-                                    println!("Flyline logs streaming to {}", dest);
+                    Some(Commands::Log { subcommand }) => {
+                        match subcommand {
+                            LogSubcommands::Dump { last } => {
+                                match crate::logging::get_filtered_logs(last.as_deref()) {
+                                    Ok(entries) => {
+                                        use std::io::Write;
+                                        let stdout = std::io::stdout();
+                                        let mut out = stdout.lock();
+                                        for entry in entries {
+                                            if let Err(e) = writeln!(out, "{}", entry) {
+                                                eprintln!("Failed to write log entry: {}", e);
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Failed to retrieve logs: {}", e);
+                                    }
                                 }
                             }
-                            Err(e) => eprintln!("Failed to stream logs: {}", e),
-                        },
-                    },
+                            LogSubcommands::Copy { last } => {
+                                match crate::logging::get_filtered_logs(last.as_deref()) {
+                                    Ok(entries) => {
+                                        let len = entries.len();
+                                        let logs_to_copy = if len > 10_000 {
+                                            entries[len - 10_000..].to_vec()
+                                        } else {
+                                            entries
+                                        };
+                                        let joined_logs = logs_to_copy.join("\n");
+                                        if let Err(e) = crossterm::execute!(
+                                        std::io::stdout(),
+                                        crossterm::clipboard::CopyToClipboard::to_clipboard_from(joined_logs)
+                                    ) {
+                                        eprintln!("Failed to copy logs to clipboard via OSC 52: {}", e);
+                                    } else {
+                                        println!("Copied {} log lines!", logs_to_copy.len());
+                                    }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Failed to retrieve logs: {}", e);
+                                    }
+                                }
+                            }
+                            LogSubcommands::SetLevel { level } => {
+                                let filter = log::LevelFilter::from(level);
+                                log::set_max_level(filter);
+                                log::info!("Log level set to {:?}", filter);
+                            }
+                            LogSubcommands::Stream { dest } => match logging::stream_logs(&dest) {
+                                Ok(()) => {
+                                    if dest == "terminal" {
+                                        log::info!("Log streaming to terminal");
+                                    } else {
+                                        println!("Flyline logs streaming to {}", dest);
+                                    }
+                                }
+                                Err(e) => eprintln!("Failed to stream logs: {}", e),
+                            },
+                        }
+                    }
                     Some(Commands::RunTutorial { enabled }) => {
                         let enabled = enabled.unwrap_or(true);
                         log::info!("Run tutorial set to {}", enabled);
@@ -1586,6 +1669,255 @@ impl Flyline {
     }
 }
 
+fn get_os_pretty_name() -> Option<String> {
+    if let Ok(content) = std::fs::read_to_string("/etc/os-release") {
+        for line in content.lines() {
+            if let Some(rest) = line.strip_prefix("PRETTY_NAME=") {
+                let name = rest.trim_matches('"').trim_matches('\'');
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn get_libc_version() -> Option<String> {
+    let output = std::process::Command::new("ldd")
+        .arg("--version")
+        .output()
+        .ok()?;
+
+    // Check stdout first
+    let out_str = String::from_utf8_lossy(&output.stdout);
+    if let Some(line) = out_str.lines().next() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    // Fallback to stderr (e.g. musl ldd outputting to stderr)
+    let err_str = String::from_utf8_lossy(&output.stderr);
+    if let Some(line) = err_str.lines().next() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    None
+}
+
+fn get_os_info() -> String {
+    unsafe {
+        let mut uts: libc::utsname = std::mem::zeroed();
+        if libc::uname(&mut uts) == 0 {
+            let sysname = std::ffi::CStr::from_ptr(uts.sysname.as_ptr()).to_string_lossy();
+            let release = std::ffi::CStr::from_ptr(uts.release.as_ptr()).to_string_lossy();
+            let machine = std::ffi::CStr::from_ptr(uts.machine.as_ptr()).to_string_lossy();
+            let os_name = if sysname == "Darwin" {
+                "macOS".to_string()
+            } else {
+                get_os_pretty_name().unwrap_or_else(|| sysname.into_owned())
+            };
+            format!("{} (kernel {} {})", os_name, release, machine)
+        } else {
+            "Unknown OS".to_string()
+        }
+    }
+}
+
+fn get_system_linker_version() -> Option<String> {
+    let output = std::process::Command::new("ld").arg("-v").output().ok()?;
+
+    // Check stdout first
+    let out_str = String::from_utf8_lossy(&output.stdout);
+    if let Some(line) = out_str.lines().next() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    // Fallback to stderr (Apple's ld -v prints to stderr)
+    let err_str = String::from_utf8_lossy(&output.stderr);
+    if let Some(line) = err_str.lines().next() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    None
+}
+
+fn get_dynamic_linker_version() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        get_libc_version()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("sw_vers").output().ok()?;
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut product = "macOS".to_string();
+            let mut build = "".to_string();
+            for line in stdout.lines() {
+                if let Some(version) = line.strip_prefix("ProductVersion:") {
+                    product = format!("macOS {}", version.trim());
+                } else if let Some(b) = line.strip_prefix("BuildVersion:") {
+                    build = format!(" (Build {})", b.trim());
+                }
+            }
+            return Some(format!("dyld (tied to {}{})", product, build));
+        }
+        None
+    }
+    #[cfg(target_os = "freebsd")]
+    {
+        let output = std::process::Command::new("freebsd-version")
+            .arg("-u")
+            .output()
+            .ok()?;
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Some(line) = stdout.lines().next() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    return Some(format!("rtld (tied to FreeBSD userland {})", trimmed));
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
+    {
+        None
+    }
+}
+
+fn get_cpu_info() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(content) = std::fs::read_to_string("/proc/cpuinfo") {
+            for line in content.lines() {
+                if line.starts_with("model name")
+                    || line.starts_with("Processor")
+                    || line.starts_with("Hardware")
+                {
+                    if let Some(pos) = line.find(':') {
+                        let model = line[pos + 1..].trim().to_string();
+                        if !model.is_empty() {
+                            let cores = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+                            let cores_str = if cores > 0 {
+                                format!(" ({} cores)", cores)
+                            } else {
+                                String::new()
+                            };
+                            return format!("{}{}", model, cores_str);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    format!("{} architecture", std::env::consts::ARCH)
+}
+
+fn get_bash_version() -> String {
+    crate::bash_funcs::get_envvar_value("BASH_VERSION").unwrap_or_else(|| "unknown".to_string())
+}
+
+fn show_version(copy: bool) {
+    let version = env!("CARGO_PKG_VERSION");
+    let git_hash = env!("GIT_HASH");
+    let build_mode = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    let build_time = env!("BUILD_TIME");
+    let build_target = env!("BUILD_TARGET");
+    let rustc_version = env!("RUSTC_VERSION");
+
+    let bash_version = get_bash_version();
+    let shell =
+        crate::bash_funcs::get_envvar_value("SHELL").unwrap_or_else(|| "unknown".to_string());
+    let term = crate::bash_funcs::get_envvar_value("TERM").unwrap_or_else(|| "unknown".to_string());
+    let term_program = crate::bash_funcs::get_envvar_value("TERM_PROGRAM")
+        .unwrap_or_else(|| "unknown".to_string());
+    let term_program_version = crate::bash_funcs::get_envvar_value("TERM_PROGRAM_VERSION")
+        .unwrap_or_else(|| "unknown".to_string());
+    let lang = crate::bash_funcs::get_envvar_value("LANG").unwrap_or_else(|| "unknown".to_string());
+    let lc_all =
+        crate::bash_funcs::get_envvar_value("LC_ALL").unwrap_or_else(|| "unknown".to_string());
+    let lc_ctype =
+        crate::bash_funcs::get_envvar_value("LC_CTYPE").unwrap_or_else(|| "unknown".to_string());
+
+    let os_info = get_os_info();
+    let sys_linker = get_system_linker_version().unwrap_or_else(|| "unknown".to_string());
+    let dyn_linker = get_dynamic_linker_version().unwrap_or_else(|| "unknown".to_string());
+    let cpu_info = get_cpu_info();
+
+    let version_text = format!(
+        "flyline {}\n\
+         git hash: {}\n\
+         build mode: {}\n\
+         build datetime: {}\n\
+         build target: {}\n\
+         rustc version: {}\n\
+         \n\
+         Running in: Bash {}\n\
+         shell: {}\n\
+         \n\
+         Running in: {}\n\
+         program: {}\n\
+         program version: {}\n\
+         locale: {} (LC_ALL: {}, LC_CTYPE: {})\n\
+         \n\
+         Running in: {}\n\
+         system linker: {}\n\
+         dynamic linker: {}\n\
+         \n\
+         Running on: {}\n\
+         \n\
+         Running in: a simulation",
+        version,
+        git_hash,
+        build_mode,
+        build_time,
+        build_target,
+        rustc_version,
+        bash_version,
+        shell,
+        term,
+        term_program,
+        term_program_version,
+        lang,
+        lc_all,
+        lc_ctype,
+        os_info,
+        sys_linker,
+        dyn_linker,
+        cpu_info
+    );
+
+    println!("{}", version_text);
+
+    if copy {
+        if let Err(e) = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::clipboard::CopyToClipboard::to_clipboard_from(version_text)
+        ) {
+            log::error!("Failed to copy version text to clipboard via OSC 52: {}", e);
+        }
+        println!();
+        println!("\x1b[32mCopied to clipboard!\x1b[0m");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1632,5 +1964,16 @@ mod tests {
             values.contains(&"--show-animations=PREFIX_DELIMtrue".to_string())
                 || values.contains(&"--show-animations=PREFIX_DELIMfalse".to_string())
         );
+    }
+
+    #[test]
+    fn test_version_helpers() {
+        let os_info = get_os_info();
+        let cpu_info = get_cpu_info();
+        let bash_ver = get_bash_version();
+
+        assert!(!os_info.is_empty());
+        assert!(!cpu_info.is_empty());
+        assert!(!bash_ver.is_empty());
     }
 }
