@@ -1,5 +1,12 @@
 pub(crate) const CHANGELOG: &str = r#"# Changelog
 
+## v1.3.0
+- **Leader Keys**: Added support for chorded keybinding sequences (e.g., `Ctrl+x` followed by `Ctrl+f`) via the new `setLeaderKey` and `unsetLeaderKey` actions and the `leaderKeyActive` context variable.
+- **Leader Key Visual Feedback**: Introduced the `leader-mode` prompt widget to display visual indicators (like ` X `) in the prompt when the leader key state is active.
+- **String Insertion Action**: `insertString(...)` action allows inserting arbitrary strings into the buffer.
+- **Strict Modifier Matching**: Switched to strict modifier equality matching to prevent modifier-overlap conflicts when dispatching key actions.
+- **Key List Autocomplete & Completion**: Added autocomplete support for listing keybindings for a specific key event (`flyline key list <key>`).
+
 ## v1.2.5
 - **Global Allocator**: Integrated `mimalloc` to bypass Bash's non-thread-safe allocator and prevent heap corruption on multi-threaded allocations.
 - **Nested Arithmetic Lexing**: Stateful lexing updates to correctly parse nested brackets/parentheses inside arithmetic `$(( ... ))` blocks.
