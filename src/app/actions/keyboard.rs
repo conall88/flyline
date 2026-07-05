@@ -1034,6 +1034,8 @@ pub enum KeyRemap {
         from: KeyModifiers,
         to: KeyModifiers,
     },
+    /// Remap a key event with modifiers to another key event.
+    Event { from: KeyEvent, to: KeyEvent },
 }
 
 /// Parse a single key-code name (no modifiers) into a [`KeyCode`].
@@ -1158,6 +1160,17 @@ fn parse_single_modifier(s: &str) -> Result<KeyModifiers> {
 /// Parse and validate a remap pair (from, to).  Modifiers may only be remapped
 /// to modifiers; keys may only be remapped to keys.
 pub fn try_parse_remap(from: &str, to: &str) -> Result<KeyRemap> {
+    if let Ok(KeyEventMatch::Exact(from_event)) = KeyEventMatch::try_from(from) {
+        if let Ok(KeyEventMatch::Exact(to_event)) = KeyEventMatch::try_from(to) {
+            if !from_event.modifiers.is_empty() || !to_event.modifiers.is_empty() {
+                return Ok(KeyRemap::Event {
+                    from: from_event,
+                    to: to_event,
+                });
+            }
+        }
+    }
+
     let from_mod = parse_single_modifier(from);
     let to_mod = parse_single_modifier(to);
     match (&from_mod, &to_mod) {
@@ -1198,7 +1211,20 @@ pub fn apply_remappings(key: KeyEvent, remappings: &[KeyRemap]) -> KeyEvent {
         return key;
     }
 
-    // Modifier remaps are applied simultaneously from the original modifier set.
+    // 1. Key event remappings take precedence
+    for remap in remappings {
+        if let KeyRemap::Event { from, to } = remap {
+            if key.code == from.code && key.modifiers == from.modifiers {
+                return KeyEvent {
+                    code: to.code,
+                    modifiers: to.modifiers,
+                    ..key
+                };
+            }
+        }
+    }
+
+    // 2. Modifier remaps are applied simultaneously from the original modifier set.
     let original_modifiers = key.modifiers;
     let mut new_modifiers = KeyModifiers::empty();
     for &bit in &[
@@ -1248,8 +1274,14 @@ impl Binding {
     /// expression, and an action.  This is infallible: parsing happens at
     /// compile time via the typed `KeyCode` / `KeyModifiers` constructors.
     fn new(key_events: &[KeyEventMatch], context: ContextExpr, action: KeyEventAction) -> Self {
+        let mut unique_events = Vec::new();
+        for event in key_events {
+            if !unique_events.contains(event) {
+                unique_events.push(event.clone());
+            }
+        }
         Self {
-            key_events: key_events.to_vec(),
+            key_events: unique_events,
             context,
             action,
         }
@@ -1676,6 +1708,27 @@ pub fn key_sequence_completer(current: &std::ffi::OsStr) -> Vec<CompletionCandid
                 prefix + "+"
             };
             out.push(CompletionCandidate::new(format!("{}{}", prefix, k)));
+        }
+    }
+
+    out
+}
+
+/// Completer for key remapping args.
+/// Suggests standard key sequences as well as standalone capitalized modifier names.
+pub fn remap_key_completer(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
+    let current_str = current.to_string_lossy();
+    let current_lower = current_str.to_lowercase();
+
+    // 1. Get the normal key sequence completions (e.g. including "Ctrl+", "Alt+", etc.)
+    let mut out = key_sequence_completer(current);
+
+    // 2. Also support remapping standalone modifiers (e.g. "Ctrl", "Alt", "Shift", etc.).
+    for (_, mod_equivs) in MODS_TO_EQUIV_NAMES.iter() {
+        for equiv in *mod_equivs {
+            if equiv.to_lowercase().starts_with(&current_lower) {
+                out.push(CompletionCandidate::new(capitalize_first(equiv)));
+            }
         }
     }
 
@@ -2567,6 +2620,60 @@ impl KeyEventMatch {
 
         match self {
             KeyEventMatch::Exact(ke) => {
+                let has_event_remap_to_ke = remappings.iter().any(|remap| {
+                    if let KeyRemap::Event { to, .. } = remap {
+                        to.code == ke.code && to.modifiers == ke.modifiers
+                    } else {
+                        false
+                    }
+                });
+
+                if has_event_remap_to_ke {
+                    let mut physical_events = Vec::new();
+
+                    // 1. Check if the logical key itself is mapped away.
+                    let mut is_mapped_away = false;
+                    for remap in remappings {
+                        match remap {
+                            KeyRemap::Event { from, .. } => {
+                                if from.code == ke.code && from.modifiers == ke.modifiers {
+                                    is_mapped_away = true;
+                                    break;
+                                }
+                            }
+                            KeyRemap::Key { from, .. } => {
+                                if *from == ke.code {
+                                    is_mapped_away = true;
+                                    break;
+                                }
+                            }
+                            KeyRemap::Modifier { from, .. } => {
+                                if ke.modifiers.contains(*from) {
+                                    is_mapped_away = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if !is_mapped_away {
+                        physical_events.push(display_key_event(*ke));
+                    }
+
+                    // 2. Find any Event remappings that target this logical event.
+                    for remap in remappings {
+                        if let KeyRemap::Event { from, to } = remap {
+                            if to.code == ke.code && to.modifiers == ke.modifiers {
+                                physical_events.push(display_key_event(*from));
+                            }
+                        }
+                    }
+
+                    if !physical_events.is_empty() {
+                        return physical_events.join(" or ");
+                    }
+                }
+
                 let mut parts: Vec<String> = Vec::new();
                 push_modifiers(ke.modifiers, &mut parts);
                 match inverse_keycode_display(ke.code, remappings) {
@@ -2794,6 +2901,13 @@ pub fn print_bindings_table(
                         display_modifier_bit(*to)
                     );
                 }
+                KeyRemap::Event { from, to } => {
+                    println!(
+                        "  {} -> {}",
+                        display_key_event(*from),
+                        display_key_event(*to)
+                    );
+                }
             }
         }
     }
@@ -2942,6 +3056,27 @@ mod tests {
         assert!(try_parse_remap("unknownkey", "z").is_err());
     }
 
+    #[test]
+    fn test_parse_remap_event() {
+        let r = try_parse_remap("ctrl+p", "up").unwrap();
+        assert_eq!(
+            r,
+            KeyRemap::Event {
+                from: KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                to: KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+            }
+        );
+
+        let r2 = try_parse_remap("ctrl+n", "alt+4").unwrap();
+        assert_eq!(
+            r2,
+            KeyRemap::Event {
+                from: KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+                to: KeyEvent::new(KeyCode::Char('4'), KeyModifiers::ALT),
+            }
+        );
+    }
+
     // --- apply_remappings ---
 
     #[test]
@@ -3011,6 +3146,62 @@ mod tests {
         assert!(!result.modifiers.contains(KeyModifiers::CONTROL));
     }
 
+    #[test]
+    fn test_apply_remappings_event() {
+        let remappings = vec![
+            KeyRemap::Event {
+                from: KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                to: KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+            },
+            KeyRemap::Event {
+                from: KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+                to: KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+            },
+            KeyRemap::Modifier {
+                from: KeyModifiers::CONTROL,
+                to: KeyModifiers::ALT,
+            },
+        ];
+
+        // 1. Ctrl+P should map to Up
+        let k1 = key_with_mods(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        let r1 = apply_remappings(k1, &remappings);
+        assert_eq!(r1.code, KeyCode::Up);
+        assert_eq!(r1.modifiers, KeyModifiers::empty());
+
+        // 2. Ctrl+A should map to Esc (Event remap takes precedence over Modifier remap)
+        let k2 = key_with_mods(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        let r2 = apply_remappings(k2, &remappings);
+        assert_eq!(r2.code, KeyCode::Esc);
+        assert_eq!(r2.modifiers, KeyModifiers::empty());
+
+        // 3. Ctrl+B should map to Alt+B (Modifier remap still applies to other keys)
+        let k3 = key_with_mods(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        let r3 = apply_remappings(k3, &remappings);
+        assert_eq!(r3.code, KeyCode::Char('b'));
+        assert_eq!(r3.modifiers, KeyModifiers::ALT);
+    }
+
+    #[test]
+    fn test_apply_remappings_compound() {
+        let remappings = vec![
+            KeyRemap::Modifier {
+                from: KeyModifiers::CONTROL,
+                to: KeyModifiers::ALT,
+            },
+            KeyRemap::Key {
+                from: KeyCode::Char('p'),
+                to: KeyCode::Char('k'),
+            },
+        ];
+
+        // Ctrl+P should map to Alt+K (Modifier and Key remap applied simultaneously/independently)
+        let k = key_with_mods(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        let r = apply_remappings(k, &remappings);
+        assert_eq!(r.code, KeyCode::Char('k'));
+        assert_eq!(r.modifiers, KeyModifiers::ALT);
+    }
+
     // --- inverse display ---
 
     #[test]
@@ -3064,6 +3255,69 @@ mod tests {
         }];
         let kem = KeyEventMatch::Exact(key(KeyCode::Enter));
         assert_eq!(kem.display_with_remapping(&remappings), "Enter");
+    }
+
+    #[test]
+    fn test_display_remapped_event_shows_alternatives() {
+        let remappings = vec![KeyRemap::Event {
+            from: KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            to: KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+        }];
+
+        // Up is bound, Ctrl+P is mapped to Up. Physical keys should show "Up or Ctrl+P"
+        let kem = KeyEventMatch::Exact(key(KeyCode::Up));
+        assert_eq!(kem.display_with_remapping(&remappings), "Up or Ctrl+p");
+
+        // If the logical key itself is mapped away:
+        // E.g. Ctrl+P -> Up, and Up -> Down.
+        // Then Up is mapped away (so it's not a physical key option anymore).
+        // A binding on Down should show "Ctrl+P or Up" (or just the ones that target it).
+        let remappings_chain = vec![
+            KeyRemap::Event {
+                from: KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                to: KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+            },
+            KeyRemap::Event {
+                from: KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+                to: KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+            },
+        ];
+        let kem_down = KeyEventMatch::Exact(key(KeyCode::Down));
+        assert_eq!(
+            kem_down.display_with_remapping(&remappings_chain),
+            "Down or Up"
+        );
+    }
+
+    #[test]
+    fn test_display_remapped_event_multiple_alternatives() {
+        let remappings = vec![
+            KeyRemap::Event {
+                from: KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                to: KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+            },
+            KeyRemap::Event {
+                from: KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT),
+                to: KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+            },
+        ];
+
+        let kem = KeyEventMatch::Exact(key(KeyCode::Up));
+        // Up is bound, Ctrl+P and Alt+P are mapped to Up. Physical keys should show all options.
+        assert_eq!(
+            kem.display_with_remapping(&remappings),
+            "Up or Ctrl+p or Alt+p"
+        );
+    }
+
+    #[test]
+    fn test_print_bindings_table_with_event_remap() {
+        let remappings = vec![KeyRemap::Event {
+            from: KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            to: KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+        }];
+        // Ensure that print_bindings_table runs with KeyRemap::Event without panic
+        print_bindings_table(&[], None, &remappings);
     }
 
     #[test]
@@ -3454,6 +3708,44 @@ mod tests {
         for a in KeyEventAction::iter() {
             assert!(!a.description().is_empty());
         }
+    }
+
+    #[test]
+    fn test_binding_new_deduplicates_key_events() {
+        let events = vec![
+            KeyEventMatch::Exact(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            KeyEventMatch::Exact(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            KeyEventMatch::Exact(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)),
+        ];
+        let binding = Binding::new(
+            &events,
+            ContextExpr::from(ContextVar::Always),
+            KeyEventAction::MoveLeftStartOfLine,
+        );
+        assert_eq!(binding.key_events.len(), 2);
+        assert_eq!(
+            binding.key_events[0],
+            KeyEventMatch::Exact(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL))
+        );
+        assert_eq!(
+            binding.key_events[1],
+            KeyEventMatch::Exact(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL))
+        );
+    }
+
+    #[test]
+    fn test_remap_key_completer() {
+        use std::ffi::OsStr;
+        // Test that key_sequence completions are included
+        let res_z = remap_key_completer(OsStr::new("z"));
+        assert!(res_z.iter().any(|c| c.get_value() == "z"));
+
+        // Test that capitalized standalone modifiers are suggested
+        let res_ct = remap_key_completer(OsStr::new("ct"));
+        assert!(res_ct.iter().any(|c| c.get_value() == "Ctrl"));
+
+        let res_al = remap_key_completer(OsStr::new("al"));
+        assert!(res_al.iter().any(|c| c.get_value() == "Alt"));
     }
 }
 
