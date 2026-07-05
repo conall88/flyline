@@ -44,8 +44,15 @@ body:
         # Then copy logs and paste them here:
         flyline log copy --last 10s
         ```
-      placeholder: Paste the output of 'flyline log copy --last 10s' here...
-      render: text
+      value: |
+        <details>
+        <summary>Click to expand logs</summary>
+
+        ```text
+        <paste logs here>
+        ```
+
+        </details>
     validations:
       required: false
   - type: textarea
