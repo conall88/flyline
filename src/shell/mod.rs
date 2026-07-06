@@ -84,7 +84,17 @@ pub trait ShellBackend: Sync {
     /// Non-zero when the host shell received a terminating signal.
     fn read_terminating_signal(&self) -> libc::c_int;
 
+    /// The completion-script dialect flycomp should synthesize for this host.
+    /// Bash hosts get a `complete -F` script; zsh gets a `#compdef` function.
+    fn flycomp_output_format(&self) -> flycomp::OutputFormat {
+        flycomp::OutputFormat::Bash
+    }
+
     /// Resolve where a synthesized completion script should be written.
+    ///
+    /// The path and on-disk format are backend-specific: Bash writes a
+    /// `complete -F` script named `<cmd>` under a bash-completion dir, while zsh
+    /// writes a `#compdef` function named `_<cmd>` under a dir on its `$fpath`.
     fn resolve_completion_script_path(
         &self,
         command_word: &str,
@@ -98,6 +108,20 @@ pub trait ShellBackend: Sync {
         script: &str,
         flycomp_output: Option<&str>,
     ) -> Result<PathBuf, std::io::Error>;
+
+    /// Make a freshly written completion script active in the running shell so a
+    /// re-triggered Tab uses it immediately. Bash evaluates the script in-process
+    /// (see `evaluate_shell_string`); zsh reloads the function (written at the
+    /// path from `resolve_completion_script_path`) into its completion daemon.
+    /// The default evaluates the script text, matching the original behaviour.
+    fn activate_completion_script(
+        &self,
+        _command_word: &str,
+        script: &str,
+        _flycomp_output: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.evaluate_shell_string(script)
+    }
 
     /// Read command history from the host shell's in-memory list.
     fn parse_history_from_memory(&self) -> Vec<HistoryRecord>;

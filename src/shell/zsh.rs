@@ -21,6 +21,15 @@ const READY_MARKER: &str = "READY";
 const FLYBEGIN: &str = "<<FLYBEGIN>>";
 const FLYEND: &str = "<<FLYEND>>";
 const FLYCD: &str = "<<FLYCD>>";
+const FLYRELOAD: &str = "<<FLYRELOAD>>";
+
+/// First line of a broker request that asks the daemon to (re)load a completion
+/// function instead of capturing completions. A real cwd never starts with this.
+const RELOAD_SENTINEL: &str = "\x01RELOAD";
+
+/// Default dir for flyline-synthesized zsh completions. Must stay in sync with
+/// the `fpath` prepend in `zsh_comp_daemon.zsh` so the `_<cmd>` files are found.
+const ZSH_COMPLETIONS_DIR: &str = "~/.local/share/flyline/zsh/completions/";
 
 /// Read caps so a bad rc/completion can't hang flyline (fail-open on timeout).
 const DAEMON_BOOT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -251,6 +260,24 @@ fn run_zsh_timeout(args: &[&str], timeout: Duration) -> Option<String> {
             }
             Err(_) => return None,
         }
+    }
+}
+
+/// The on-disk name for a synthesized zsh completion of `cmd_word`.
+///
+/// zsh autoloadable completion functions must be named `_<cmd>` and live on
+/// `$fpath` (the daemon prepends `ZSH_COMPLETIONS_DIR`); bash's `<cmd>` name in
+/// the bash-completion dir would never be picked up here. A path-like command
+/// word (alias expansion, absolute path) is reduced to its file name first.
+fn zsh_completion_file_name(cmd_word: &str) -> String {
+    let base = Path::new(cmd_word)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(cmd_word);
+    if base.starts_with('_') {
+        base.to_string()
+    } else {
+        format!("_{base}")
     }
 }
 
@@ -555,6 +582,53 @@ impl ShellBackend for ZshBackend {
         }
     }
 
+    fn flycomp_output_format(&self) -> flycomp::OutputFormat {
+        // zsh consumes native `#compdef` functions, not bash `complete -F` scripts.
+        flycomp::OutputFormat::Zsh
+    }
+
+    fn activate_completion_script(
+        &self,
+        command_word: &str,
+        _script: &str,
+        flycomp_output: Option<&str>,
+    ) -> anyhow::Result<()> {
+        // The script is already on disk (resolve_and_write_completion_script ran);
+        // load that `_<cmd>` file into the completion daemon so the immediate Tab
+        // re-run uses it, mirroring bash's in-process eval.
+        let path = self.resolve_completion_script_path(command_word, flycomp_output);
+        let path_str = path.to_string_lossy().into_owned();
+        if path_str.contains('\n') {
+            anyhow::bail!("completion script path must not contain newlines");
+        }
+
+        let mut activated = false;
+        // Shared broker first, so every session picks up the new completion.
+        if !broker_disabled() && broker_reload(&path_str) {
+            activated = true;
+        }
+        // Also reload this process's in-process daemon if it exists (broker-disabled
+        // path, or broker unreachable), so the local capture below sees it.
+        if let Ok(mut guard) = self.comp_daemon.lock() {
+            if let Some(daemon) = guard.as_mut() {
+                if daemon.reload(&path_str).is_ok() {
+                    activated = true;
+                }
+            }
+        }
+        if activated {
+            return Ok(());
+        }
+        // Fail-open: boot an in-process daemon and reload there.
+        self.ensure_comp_daemon()?;
+        let mut guard = self.comp_daemon.lock().unwrap();
+        let daemon = guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("completion daemon not initialized"))?;
+        daemon.reload(&path_str)?;
+        Ok(())
+    }
+
     fn reset_caches(&self) {}
 
     fn warm_completion_caches(&self) {
@@ -582,11 +656,8 @@ impl ShellBackend for ZshBackend {
             .filter(|alias| !alias.is_empty())
             .unwrap_or(command_word);
         let cmd_word = alias_def.split_whitespace().next().unwrap_or(alias_def);
-        let file_name = Path::new(cmd_word)
-            .file_name()
-            .and_then(|f| f.to_str())
-            .unwrap_or(cmd_word);
-        let output_dir = flycomp_output.unwrap_or("~/.local/share/bash-completion/completions/");
+        let file_name = zsh_completion_file_name(cmd_word);
+        let output_dir = flycomp_output.unwrap_or(ZSH_COMPLETIONS_DIR);
         Path::new(&self.expand_path(output_dir)).join(file_name)
     }
 
@@ -658,6 +729,28 @@ impl CompDaemon {
             .write_all(b"\x15")
             .context("reset daemon line")?;
         self.master.flush().context("flush after reset")?;
+        Ok(output)
+    }
+
+    /// Load the `_<cmd>` completion function at `path` into the running daemon so
+    /// subsequent captures use it. Types the path then fires the `fly-reload`
+    /// widget (^G) which autoloads + `compdef`s it (see zsh_comp_daemon.zsh).
+    fn reload(&mut self, path: &str) -> anyhow::Result<String> {
+        if path.contains('\n') {
+            anyhow::bail!("reload path must not contain newlines");
+        }
+        self.master
+            .write_all(path.as_bytes())
+            .context("write reload path")?;
+        // ^G -> fly-reload widget: register the completion + clear buffer.
+        self.master.write_all(b"\x07").context("write ^G")?;
+        self.master.flush().context("flush reload path")?;
+        let output = read_until_marker_timeout(&self.master, FLYRELOAD, CAPTURE_TIMEOUT)?;
+        // Clear the line in case the widget left anything behind (Ctrl-U).
+        self.master
+            .write_all(b"\x15")
+            .context("reset daemon line")?;
+        self.master.flush().context("flush after reload")?;
         Ok(output)
     }
 }
@@ -885,6 +978,44 @@ fn broker_request(cwd: &str, buffer_at_cursor: &str) -> Option<String> {
     Some(resp)
 }
 
+/// Ask the broker (spawning it if needed) to (re)load the completion function at
+/// `script_path`. Returns true when the daemon acknowledged with the reload
+/// marker. Fail-open: any error returns false so activation falls back locally.
+fn broker_reload(script_path: &str) -> bool {
+    // Under `cargo test` current_exe() is the harness; never spawn a broker.
+    if cfg!(test) {
+        return false;
+    }
+    let Some(path) = broker_socket_path() else {
+        return false;
+    };
+    let Some(mut stream) = connect_or_spawn_broker(&path) else {
+        return false;
+    };
+    if stream
+        .set_read_timeout(Some(BROKER_REQUEST_TIMEOUT))
+        .is_err()
+        || stream
+            .set_write_timeout(Some(BROKER_REQUEST_TIMEOUT))
+            .is_err()
+    {
+        return false;
+    }
+    let req = format!("{RELOAD_SENTINEL}\n{script_path}\n");
+    if stream.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+    if stream.flush().is_err() {
+        return false;
+    }
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let mut resp = String::new();
+    if stream.read_to_string(&mut resp).is_err() {
+        return false;
+    }
+    resp.contains(FLYRELOAD)
+}
+
 /// Connect to the broker, spawning a detached one and polling for its socket if
 /// none is listening yet.
 fn connect_or_spawn_broker(path: &Path) -> Option<UnixStream> {
@@ -963,29 +1094,50 @@ pub fn run_comp_broker(socket_path: &Path) -> i32 {
         if let Ok(mut act) = last_activity.lock() {
             *act = Instant::now();
         }
-        if let Some((cwd, buffer)) = read_broker_request(&stream) {
-            let blob = daemon.cd_and_capture(&cwd, &buffer).unwrap_or_default();
-            let _ = stream.write_all(blob.as_bytes());
+        match read_broker_request(&stream) {
+            Some(BrokerRequest::Capture { cwd, buffer }) => {
+                let blob = daemon.cd_and_capture(&cwd, &buffer).unwrap_or_default();
+                let _ = stream.write_all(blob.as_bytes());
+            }
+            Some(BrokerRequest::Reload { path }) => {
+                let blob = daemon.reload(&path).unwrap_or_default();
+                let _ = stream.write_all(blob.as_bytes());
+            }
+            None => {}
         }
         // Dropping the stream closes it: EOF frames the response for the client.
     }
     0
 }
 
-/// Read a `<cwd>\n<buffer>\n` request. A missing second line yields an empty
-/// buffer (harmless empty completion).
-fn read_broker_request(stream: &UnixStream) -> Option<(String, String)> {
+/// A request served by the broker: capture completions, or (re)load a
+/// synthesized completion function into the daemon.
+enum BrokerRequest {
+    Capture { cwd: String, buffer: String },
+    Reload { path: String },
+}
+
+/// Read a broker request. A capture request is `<cwd>\n<buffer>\n`; a reload
+/// request is `<RELOAD_SENTINEL>\n<path>\n`. A missing second line yields an
+/// empty tail (harmless empty completion / no-op reload).
+fn read_broker_request(stream: &UnixStream) -> Option<BrokerRequest> {
     let clone = stream.try_clone().ok()?;
     let _ = clone.set_read_timeout(Some(BROKER_REQUEST_TIMEOUT));
     let mut reader = BufReader::new(clone);
-    let mut cwd = String::new();
-    let mut buffer = String::new();
-    reader.read_line(&mut cwd).ok()?;
-    reader.read_line(&mut buffer).ok()?;
-    Some((
-        cwd.trim_end_matches('\n').to_string(),
-        buffer.trim_end_matches('\n').to_string(),
-    ))
+    let mut first = String::new();
+    reader.read_line(&mut first).ok()?;
+    let first = first.trim_end_matches('\n').to_string();
+    let mut second = String::new();
+    reader.read_line(&mut second).ok()?;
+    let second = second.trim_end_matches('\n').to_string();
+    if first == RELOAD_SENTINEL {
+        Some(BrokerRequest::Reload { path: second })
+    } else {
+        Some(BrokerRequest::Capture {
+            cwd: first,
+            buffer: second,
+        })
+    }
 }
 
 /// Exit the broker process once it has been idle past `BROKER_IDLE_TIMEOUT`.
@@ -1302,5 +1454,133 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn zsh_completion_file_name_prefixes_underscore() {
+        assert_eq!(zsh_completion_file_name("kubectl"), "_kubectl");
+        // Path-like command words are reduced to their file name.
+        assert_eq!(
+            zsh_completion_file_name("/opt/homebrew/bin/kubectl"),
+            "_kubectl"
+        );
+        assert_eq!(zsh_completion_file_name("~/bin/foo"), "_foo");
+        // An already-underscored name is not doubled.
+        assert_eq!(zsh_completion_file_name("_kubectl"), "_kubectl");
+    }
+
+    #[test]
+    fn zsh_backend_synthesizes_zsh_completions() {
+        assert!(matches!(
+            ZSH_BACKEND.flycomp_output_format(),
+            flycomp::OutputFormat::Zsh
+        ));
+    }
+
+    #[test]
+    fn bash_backend_synthesizes_bash_completions() {
+        assert!(matches!(
+            crate::shell::BashBackend.flycomp_output_format(),
+            flycomp::OutputFormat::Bash
+        ));
+    }
+
+    /// End-to-end: a `_<cmd>` file written outside the daemon's default fpath is
+    /// registered via the broker reload verb (the `fly-reload` widget adds its dir
+    /// to fpath + `compdef`s it), then the next capture returns its completions.
+    #[test]
+    fn broker_reload_registers_synthesized_completion() {
+        if !zsh_available() {
+            eprintln!("skipping broker reload: zsh not available");
+            return;
+        }
+        let stamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let comp_dir =
+            std::env::temp_dir().join(format!("flyline-comp-{}-{}", std::process::id(), stamp));
+        std::fs::create_dir_all(&comp_dir).unwrap();
+        let comp_file = comp_dir.join("_flytest");
+        // Autoload-compatible compdef offering static subcommands (no binary call).
+        std::fs::write(
+            &comp_file,
+            "#compdef flytest\n\
+             _flytest() {\n\
+               local -a subcmds\n\
+               subcmds=(alpha beta gamma)\n\
+               _describe 'command' subcmds\n\
+             }\n\
+             if [ \"$funcstack[1]\" = \"_flytest\" ]; then\n\
+               _flytest \"$@\"\n\
+             else\n\
+               compdef _flytest flytest\n\
+             fi\n",
+        )
+        .unwrap();
+
+        let sock = std::env::temp_dir().join(format!(
+            "flyline-test-reload-{}-{}.sock",
+            std::process::id(),
+            stamp
+        ));
+        let broker_sock = sock.clone();
+        #[allow(clippy::disallowed_methods)]
+        std::thread::spawn(move || {
+            run_comp_broker(&broker_sock);
+        });
+
+        let connect = || -> Option<UnixStream> {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                if let Ok(s) = UnixStream::connect(&sock) {
+                    return Some(s);
+                }
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+
+        // Reload request.
+        let mut stream = connect().expect("connect for reload");
+        stream
+            .set_read_timeout(Some(BROKER_REQUEST_TIMEOUT))
+            .unwrap();
+        stream
+            .write_all(format!("{RELOAD_SENTINEL}\n{}\n", comp_file.display()).as_bytes())
+            .unwrap();
+        stream.flush().unwrap();
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).unwrap();
+        assert!(
+            resp.contains(FLYRELOAD),
+            "reload not acknowledged, got: {resp:?}"
+        );
+
+        // Capture request now sees the freshly registered completion.
+        let mut stream = connect().expect("connect for capture");
+        stream
+            .set_read_timeout(Some(BROKER_REQUEST_TIMEOUT))
+            .unwrap();
+        let cwd = std::env::temp_dir();
+        stream
+            .write_all(format!("{}\nflytest \n", cwd.display()).as_bytes())
+            .unwrap();
+        stream.flush().unwrap();
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).unwrap();
+        let hits = parse_capture_output(&resp);
+        let values: Vec<&str> = hits.iter().map(|(v, _)| v.as_str()).collect();
+        assert!(
+            values.contains(&"alpha") && values.contains(&"beta"),
+            "expected synthesized subcommands, got {values:?}"
+        );
+
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_dir_all(&comp_dir);
     }
 }

@@ -1183,17 +1183,21 @@ impl<'a> App<'a> {
                                 }
                             }
 
-                            match crate::shell::backend().evaluate_shell_string(&script) {
+                            match crate::shell::backend().activate_completion_script(
+                                &command_word,
+                                &script,
+                                output_dir,
+                            ) {
                                 Ok(_) => {
                                     log::info!(
-                                        "Successfully evaluated synthesized completion script for '{}'",
+                                        "Successfully activated synthesized completion script for '{}'",
                                         command_word
                                     );
                                     self.start_tab_complete(false, None);
                                 }
                                 Err(e) => {
                                     log::error!(
-                                        "Failed to evaluate synthesized completion script: {:?}",
+                                        "Failed to activate synthesized completion script: {:?}",
                                         e
                                     );
                                     let error_message = format!(
@@ -1262,6 +1266,7 @@ impl<'a> App<'a> {
             }
         }
         let start_time = std::time::Instant::now();
+        let output_format = crate::shell::backend().flycomp_output_format();
         let shared_handle =
             crate::threads::spawn_thread(crate::threads::ThreadTag::Flycomp, move || {
                 unsafe {
@@ -1269,7 +1274,7 @@ impl<'a> App<'a> {
                 }
                 flycomp::generate_completion_output(
                     &cmd_word,
-                    flycomp::OutputFormat::Bash,
+                    output_format,
                     flycomp::SynthesisStrategy::ManPageOrRunHelp,
                     use_sandbox, // sandbox
                     5000,        // timeout_ms

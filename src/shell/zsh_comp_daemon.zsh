@@ -5,9 +5,37 @@
 # No `emulate -L zsh`: at top level that would clobber the user's completion setup.
 PROMPT=
 RPROMPT=
-# Idempotent compinit (-C skips the security check); required under NO_RCS.
+
+# flyline's own synthesized completions (see ZSH_COMPLETIONS_DIR / the fly-reload
+# widget below and resolve_completion_script_path in zsh.rs); keep this path in
+# sync. Prepended so autoloadable `_<cmd>` functions written here are discovered.
+fpath=( "${HOME}/.local/share/flyline/zsh/completions" $fpath )
+
+# Idempotent compinit. The fast `-C` path skips the security check *and* the
+# rescan of $fpath for new functions, reusing the cached dump. That means a
+# completion installed after the dump was built (e.g. a freshly `brew install`ed
+# `_kubectl`) stays invisible, which makes flyline needlessly offer to synthesize
+# one. So rebuild the dump (`-i` skips the interactive insecure-dir prompt that
+# would otherwise hang the headless daemon) whenever any $fpath dir is newer than
+# the dump; otherwise keep the fast cached path.
 autoload -Uz compinit
-(( $+functions[compinit] )) && compinit -C -d "${ZDOTDIR:-$HOME}/.zcompdump_flyline"
+if (( $+functions[compinit] )); then
+  _fly_dump="${ZDOTDIR:-$HOME}/.zcompdump_flyline"
+  _fly_stale=""
+  if [[ ! -e $_fly_dump ]]; then
+    _fly_stale=1
+  else
+    for _fly_d in $fpath; do
+      [[ -d $_fly_d && $_fly_d -nt $_fly_dump ]] && { _fly_stale=1; break; }
+    done
+  fi
+  if [[ -n $_fly_stale ]]; then
+    compinit -i -d "$_fly_dump"
+  else
+    compinit -C -d "$_fly_dump"
+  fi
+  unset _fly_dump _fly_stale _fly_d
+fi
 
 bindkey '^M' undefined
 bindkey '^J' undefined
@@ -18,6 +46,25 @@ bindkey '^I' complete-word
 fly-cd () { builtin cd -q -- "$BUFFER" 2>/dev/null; BUFFER=''; print -r -- '<<FLYCD>>' }
 zle -N fly-cd
 bindkey '^F' fly-cd
+
+# Register a flyline-synthesized completion: caller types the `_<cmd>` file path
+# then sends ^G. We add its dir to $fpath (covers a custom flycomp_output dir),
+# then autoload + `compdef` it so the very next capture uses it — no rebuild,
+# mirroring bash's in-process eval of the synthesized script.
+fly-reload () {
+  local f=$BUFFER c d
+  BUFFER=''
+  d=${f:h}; c=${${f:t}#_}
+  if [[ -n $c ]]; then
+    [[ -n $d && -d $d ]] && fpath=( $d $fpath )
+    unfunction "_$c" 2>/dev/null
+    autoload -Uz -- "_$c" 2>/dev/null
+    compdef "_$c" "$c" 2>/dev/null
+  fi
+  print -r -- '<<FLYRELOAD>>'
+}
+zle -N fly-reload
+bindkey '^G' fly-reload
 
 fly-begin () { compprefuncs=( fly-begin ); print -r -- '<<FLYBEGIN>>' }
 fly-end   () { comppostfuncs=( fly-end ); print -r -- '<<FLYEND>>' }
