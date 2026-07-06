@@ -67,7 +67,16 @@ zle -N fly-reload
 bindkey '^G' fly-reload
 
 fly-begin () { compprefuncs=( fly-begin ); print -r -- '<<FLYBEGIN>>' }
-fly-end   () { comppostfuncs=( fly-end ); print -r -- '<<FLYEND>>' }
+# fly-end reports whether a completion function is registered for the command
+# word ($_comps[cmd]) so Rust can tell "a completer ran but had nothing to add"
+# (e.g. `kubectl get` with no cluster -> stay silent) apart from "no completer
+# exists" (-> offer to synthesize one). Empty payload means no completer.
+fly-end () {
+  comppostfuncs=( fly-end )
+  local -a __fly_words; __fly_words=( ${(z)BUFFER} )
+  print -r -- "<<FLYCOMPDEF>>${_comps[${__fly_words[1]}]}"
+  print -r -- '<<FLYEND>>'
+}
 compprefuncs=( fly-begin )
 comppostfuncs=( fly-end )
 

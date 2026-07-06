@@ -22,6 +22,9 @@ const FLYBEGIN: &str = "<<FLYBEGIN>>";
 const FLYEND: &str = "<<FLYEND>>";
 const FLYCD: &str = "<<FLYCD>>";
 const FLYRELOAD: &str = "<<FLYRELOAD>>";
+/// Marker whose payload is `$_comps[<cmd>]`: non-empty means a native completion
+/// function is registered for the command word (even if it produced no matches).
+const FLYCOMPDEF: &str = "<<FLYCOMPDEF>>";
 
 /// First line of a broker request that asks the daemon to (re)load a completion
 /// function instead of capturing completions. A real cwd never starts with this.
@@ -368,17 +371,21 @@ impl ZshBackend {
         Ok(())
     }
 
+    /// Capture completions plus whether a native completer is registered for the
+    /// command word (`has_completer`), used to keep flyline from offering to
+    /// synthesize a completion when one already exists but simply had nothing to
+    /// add (e.g. `kubectl get` with no reachable cluster).
     fn capture_completions(
         &self,
         full_command: &str,
         cursor_byte_pos: usize,
-    ) -> anyhow::Result<Vec<(String, Option<String>)>> {
+    ) -> anyhow::Result<(Vec<(String, Option<String>)>, bool)> {
         let buffer_at_cursor = full_command
             .get(..cursor_byte_pos.min(full_command.len()))
             .unwrap_or(full_command);
         // Fast path: the shared broker (daemon booted once, reused across prompts).
-        if let Some(pairs) = broker_capture(&self.cwd(), buffer_at_cursor) {
-            return Ok(pairs);
+        if let Some(blob) = broker_capture(&self.cwd(), buffer_at_cursor) {
+            return Ok((parse_capture_output(&blob), capture_has_completer(&blob)));
         }
         // Fail-open: per-process in-process daemon (original behaviour).
         self.ensure_comp_daemon()?;
@@ -387,7 +394,7 @@ impl ZshBackend {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("completion daemon not initialized"))?;
         let output = daemon.capture(buffer_at_cursor)?;
-        Ok(parse_capture_output(&output))
+        Ok((parse_capture_output(&output), capture_has_completer(&output)))
     }
 }
 
@@ -556,12 +563,17 @@ impl ShellBackend for ZshBackend {
         cursor_byte_pos: usize,
         _word_under_cursor_byte_end: usize,
     ) -> anyhow::Result<ProgrammableCompleteReturn> {
-        let pairs = self.capture_completions(full_command, cursor_byte_pos)?;
+        let (pairs, has_completer) = self.capture_completions(full_command, cursor_byte_pos)?;
         let completions = pairs_to_completion_strings(&pairs);
         let mut flags = CompletionFlags::default();
         flags.quote_type = find_quote_type(word_under_cursor);
         flags.some_dont_end_in_equal_sign = completions.iter().any(|s| !s.ends_with('='));
-        let compspec_was_useful = !completions.is_empty();
+        // A registered completer that ran but produced nothing (e.g. `kubectl get`
+        // with no reachable cluster) still counts as "useful": flyline should fall
+        // silent like cobra/fig/carapace rather than offering to synthesize a
+        // completion (which can't know cluster state anyway). Only a command with
+        // no completer at all is treated as useless, which triggers the flycomp prompt.
+        let compspec_was_useful = !completions.is_empty() || has_completer;
         Ok(ProgrammableCompleteReturn::new(
             completions,
             flags,
@@ -770,6 +782,10 @@ pub fn parse_capture_output(blob: &str) -> Vec<(String, Option<String>)> {
         if line.contains(FLYEND) {
             break;
         }
+        // The completer-registration marker is metadata, not a completion value.
+        if line.contains(FLYCOMPDEF) {
+            continue;
+        }
         if inside && !line.is_empty() {
             let (value, desc) = parse_capture_line(line);
             match seen.get(&value) {
@@ -789,6 +805,18 @@ pub fn parse_capture_output(blob: &str) -> Vec<(String, Option<String>)> {
         }
     }
     out
+}
+
+/// Whether the daemon reported a native completion function for the command word
+/// (the `<<FLYCOMPDEF>>` marker carries `$_comps[cmd]`; a non-empty payload means
+/// a completer is registered). Lets the backend distinguish "a completer ran but
+/// had nothing to add" (stay silent) from "no completer exists" (offer flycomp).
+pub fn capture_has_completer(blob: &str) -> bool {
+    blob.lines().any(|line| {
+        line.trim_end_matches('\r')
+            .strip_prefix(FLYCOMPDEF)
+            .is_some_and(|rest| !rest.trim().is_empty())
+    })
 }
 
 /// Parse one compadd-capture line (`value` or `value -- description`).
@@ -921,26 +949,56 @@ fn spawn_comp_daemon(script_path: &Path) -> anyhow::Result<CompDaemon> {
 // rc-loaded boot per prompt. Strictly fail-open — any failure falls back to the
 // in-process daemon, so the broker can never wedge the shell.
 
-/// Per-rc broker socket, keyed by ~/.zshrc mtime + no-rcs so an rc edit routes to
-/// a fresh daemon. `$XDG_RUNTIME_DIR` preferred, else the temp dir.
+/// Binary identity for the broker key: the running executable's mtime + size.
+/// Any rebuild, upgrade, or reinstall rewrites the file, so this changes and
+/// clients route to a fresh broker (the previous one idles out) — no manual
+/// restart needed. `current_exe` resolves symlinks, so this works for the dev
+/// `~/.local/lib -> target/...` symlink, `cargo install`, and package-manager
+/// installs alike (not just local/standalone layouts). Size is folded in so
+/// version bumps are still distinguished under reproducible builds that pin
+/// mtime. Falls back to "0" (version-agnostic) if the path is unreadable.
+fn binary_version_key() -> String {
+    std::env::current_exe()
+        .and_then(std::fs::metadata)
+        .map(|m| {
+            let mtime = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            format!("{mtime}.{}", m.len())
+        })
+        .unwrap_or_else(|_| "0".to_string())
+}
+
+/// Broker socket filename, keyed by ~/.zshrc mtime, binary identity, and no-rcs
+/// so an rc edit *or* a new binary routes to a fresh daemon.
+fn broker_socket_name(rc_key: u64, bin_key: &str, norc: u8) -> String {
+    format!("zcompd-{rc_key}-{bin_key}-{norc}.sock")
+}
+
+/// Per-rc, per-binary broker socket. `$XDG_RUNTIME_DIR` preferred, else temp dir.
 fn broker_socket_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
     let dir = base.join("flyline");
     let _ = std::fs::create_dir_all(&dir);
-    let key = zshrc_mtime()
+    let rc_key = zshrc_mtime()
         .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let norc = u8::from(no_rcs());
-    Some(dir.join(format!("zcompd-{key}-{norc}.sock")))
+    Some(dir.join(broker_socket_name(rc_key, &binary_version_key(), norc)))
 }
 
-/// Complete `buffer_at_cursor` in `cwd` via the broker. `None` (→ in-process
-/// fallback) when disabled, unreachable, or the reply is malformed; a valid empty
-/// result is `Some(vec![])` so we don't redundantly re-capture in-process.
-fn broker_capture(cwd: &str, buffer_at_cursor: &str) -> Option<Vec<(String, Option<String>)>> {
+/// Capture `buffer_at_cursor` in `cwd` via the broker, returning the raw daemon
+/// blob (parsed by the caller so it can also read the `<<FLYCOMPDEF>>` marker).
+/// `None` (→ in-process fallback) when disabled, unreachable, or the reply is
+/// malformed; a valid empty capture still returns `Some(blob)` so we don't
+/// redundantly re-capture in-process.
+fn broker_capture(cwd: &str, buffer_at_cursor: &str) -> Option<String> {
     // Under `cargo test` current_exe() is the harness, so a spawn would re-exec
     // the whole suite. Tests drive `run_comp_broker` directly.
     if cfg!(test) {
@@ -953,7 +1011,7 @@ fn broker_capture(cwd: &str, buffer_at_cursor: &str) -> Option<Vec<(String, Opti
         return None;
     }
     match broker_request(cwd, buffer_at_cursor) {
-        Some(blob) if blob.contains(FLYEND) => Some(parse_capture_output(&blob)),
+        Some(blob) if blob.contains(FLYEND) => Some(blob),
         _ => {
             BROKER_UNAVAILABLE.store(true, Ordering::Relaxed);
             None
@@ -1470,6 +1528,65 @@ mod tests {
     }
 
     #[test]
+    fn broker_socket_name_varies_with_rc_and_binary() {
+        assert_eq!(
+            broker_socket_name(100, "200.4096", 0),
+            "zcompd-100-200.4096-0.sock"
+        );
+        // A rebuild/upgrade (new binary mtime) routes clients to a fresh broker.
+        assert_ne!(
+            broker_socket_name(100, "200.4096", 0),
+            broker_socket_name(100, "201.4096", 0)
+        );
+        // A size change alone (e.g. reproducible build, same pinned mtime) too.
+        assert_ne!(
+            broker_socket_name(100, "200.4096", 0),
+            broker_socket_name(100, "200.8192", 0)
+        );
+        // An rc edit does too, as before.
+        assert_ne!(
+            broker_socket_name(100, "200.4096", 0),
+            broker_socket_name(101, "200.4096", 0)
+        );
+        // no-rcs remains part of the key.
+        assert_ne!(
+            broker_socket_name(100, "200.4096", 0),
+            broker_socket_name(100, "200.4096", 1)
+        );
+    }
+
+    #[test]
+    fn binary_version_key_is_stable() {
+        // Must not flap within a process, or clients and broker would disagree.
+        assert_eq!(binary_version_key(), binary_version_key());
+        // mtime.size shape (or the "0" fallback for an unreadable path).
+        let key = binary_version_key();
+        assert!(
+            key == "0" || key.split('.').count() == 2,
+            "unexpected binary key shape: {key}"
+        );
+    }
+
+    #[test]
+    fn capture_has_completer_detects_registration() {
+        let registered = "<<FLYBEGIN>>\nget -- Display\n<<FLYCOMPDEF>>_kubectl\n<<FLYEND>>\n";
+        assert!(capture_has_completer(registered));
+        let empty_payload = "<<FLYBEGIN>>\n<<FLYCOMPDEF>>\n<<FLYEND>>\n";
+        assert!(!capture_has_completer(empty_payload));
+        let no_marker = "<<FLYBEGIN>>\nfoo\n<<FLYEND>>\n";
+        assert!(!capture_has_completer(no_marker));
+    }
+
+    #[test]
+    fn parse_capture_output_ignores_compdef_marker() {
+        let blob = "<<FLYBEGIN>>\nget -- Display a resource\n<<FLYCOMPDEF>>_kubectl\n<<FLYEND>>\n";
+        assert_eq!(
+            parse_capture_output(blob),
+            vec![("get".to_string(), Some("Display a resource".to_string()))],
+        );
+    }
+
+    #[test]
     fn zsh_backend_synthesizes_zsh_completions() {
         assert!(matches!(
             ZSH_BACKEND.flycomp_output_format(),
@@ -1578,6 +1695,26 @@ mod tests {
         assert!(
             values.contains(&"alpha") && values.contains(&"beta"),
             "expected synthesized subcommands, got {values:?}"
+        );
+        assert!(
+            capture_has_completer(&resp),
+            "registered _flytest should be reported as a completer, got: {resp:?}"
+        );
+
+        // A command with no registered completer must not report one — that's the
+        // signal that keeps flyline from offering flycomp only when nothing exists.
+        let mut stream = connect().expect("connect for unknown-cmd capture");
+        stream.set_read_timeout(Some(BROKER_REQUEST_TIMEOUT)).unwrap();
+        stream
+            .write_all(format!("{}\nzzznosuchcmd_flytest \n", cwd.display()).as_bytes())
+            .unwrap();
+        stream.flush().unwrap();
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let mut resp2 = String::new();
+        stream.read_to_string(&mut resp2).unwrap();
+        assert!(
+            !capture_has_completer(&resp2),
+            "unregistered command should not report a completer, got: {resp2:?}"
         );
 
         let _ = std::fs::remove_file(&sock);
