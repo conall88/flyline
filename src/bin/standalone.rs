@@ -7,8 +7,8 @@
 //!   1   — EOF or internal error
 
 use flyline::{
-    ExitState, Settings, ZSH_BACKEND, get_command, init_standalone_logging, run_comp_broker,
-    set_backend, set_cloexec,
+    ExitState, ZSH_BACKEND, backend, get_command, init_standalone_logging, run_comp_broker,
+    run_flyline_command, set_backend, set_cloexec,
 };
 
 fn catch_unwind_safe<T>(f: impl FnOnce() -> T) -> Result<T, ()> {
@@ -40,28 +40,59 @@ fn run() -> i32 {
     unsafe {
         std::env::set_var("FLYLINE_HOST", "zsh");
     }
+    set_backend(&ZSH_BACKEND);
+
+    // Subcommand dispatch: `flyline <args>` (invoked via the shell forwarding
+    // function) runs the same CLI as the Bash builtin against the persisted
+    // settings snapshot, then exits without drawing the editor or touching fd 3.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if !argv.is_empty() {
+        let _ = init_standalone_logging();
+        let mut settings = backend().load_persisted_settings();
+        // Overlay per-terminal session state (e.g. `flyline run-tutorial` sets
+        // the tutorial running for the subsequent prompts of this terminal).
+        settings.apply_session_state(&backend().load_session_state());
+        let arg_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let code = run_flyline_command(&mut settings, &arg_refs);
+        backend().persist_settings(&settings);
+        backend().persist_session_state(&settings.session_state());
+        return code;
+    }
+
     // Mark the fd 3 handoff pipe close-on-exec so helper grandchildren can't hold
     // it open and wedge the parent's `$( ... 3>&1 )` (write_command_fd3 still works).
     set_cloexec(3);
-    set_backend(&ZSH_BACKEND);
 
     if let Err(e) = init_standalone_logging() {
         eprintln!("flyline: failed to initialize logging: {e}");
     }
 
-    let mut settings = Settings::default();
+    let mut settings = backend().load_persisted_settings();
+    // Overlay per-terminal session state (tutorial progress) so the tutorial
+    // advances across this terminal's per-prompt processes, like the long-lived
+    // Bash builtin — without leaking into other terminals or the durable config.
+    settings.apply_session_state(&backend().load_session_state());
     if let Ok(init) = std::env::var("FLYLINE_INIT") {
         settings.initial_buffer = Some(init);
     }
 
-    match get_command(&mut settings) {
+    let exit_code = match get_command(&mut settings) {
         ExitState::WithCommand(cmd) => {
+            // Progress the tutorial on empty submit, matching the Bash builtin
+            // (which does this between prompts in its long-lived process).
+            settings.advance_tutorial_on_submit(&cmd);
             write_command_fd3(&cmd);
             0
         }
         ExitState::WithoutCommand => 130,
         ExitState::EOF => 1,
-    }
+    };
+
+    // Persist durable settings, plus session-scoped tutorial progress for the
+    // next prompt in this terminal.
+    backend().persist_settings(&settings);
+    backend().persist_session_state(&settings.session_state());
+    exit_code
 }
 
 fn main() {

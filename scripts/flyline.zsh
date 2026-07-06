@@ -9,6 +9,15 @@ typeset -g _FLYLINE_LOADED=1
 # Default to flyline-standalone next to the install dir (parent of scripts/).
 : ${FLYLINE_BIN:=${${(%):-%x}:A:h:h}/flyline-standalone}
 
+# Forward `flyline <subcommand>` typed at the prompt to the standalone binary so
+# the full CLI surface (run-tutorial, set-style, changelog, set-cursor, ...) is
+# available just as it is for the Bash builtin. New upstream subcommands work
+# without any change here. Fail-open if the binary is missing.
+flyline() {
+  [[ -x $FLYLINE_BIN ]] || return 127
+  "$FLYLINE_BIN" "$@"
+}
+
 _flyline_edit() {
   local last_exit=$?   # capture before emulate/anything clobbers $?
   emulate -L zsh

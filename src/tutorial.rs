@@ -85,7 +85,9 @@ pub fn generate_welcome_action_line(now: std::time::Instant, width: u16) -> (u16
 }
 
 /// Tracks progress through the interactive tutorial.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, VariantArray)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, VariantArray, serde::Serialize, serde::Deserialize,
+)]
 pub enum TutorialStep {
     Welcome,
     TutorialsTutorial,

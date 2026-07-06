@@ -47,6 +47,8 @@ mod users;
 #[cfg(feature = "standalone")]
 pub use app::{ExitState, get_command};
 #[cfg(feature = "standalone")]
+pub use cli::run_flyline_command;
+#[cfg(feature = "standalone")]
 pub use settings::Settings;
 #[cfg(feature = "standalone")]
 pub use shell::zsh::{ZSH_BACKEND, run_comp_broker, set_cloexec};
@@ -214,16 +216,7 @@ impl Flyline {
 
             self.content = match result {
                 app::ExitState::WithCommand(cmd) => {
-                    if self.settings.tutorial_step.is_active() && cmd.trim().is_empty() {
-                        self.settings.tutorial_step.next();
-                        log::info!(
-                            "Tutorial step advanced to {:?}",
-                            self.settings.tutorial_step
-                        );
-                        if !self.settings.tutorial_step.is_active() {
-                            self.settings.run_tutorial = false;
-                        }
-                    }
+                    self.settings.advance_tutorial_on_submit(&cmd);
                     cmd.into_bytes()
                 }
                 app::ExitState::EOF => {

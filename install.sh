@@ -338,6 +338,7 @@ local_main() {
     say ""
     say "Local install complete."
     say "    Activate now:        exec zsh"
+    say "    Run the tutorial:    flyline run-tutorial"
     say "    Disable in session:  flyline_disable"
     say "    Uninstall:           sh install.sh --uninstall"
     say "    Symlinks mean rebuilds are picked up automatically (no re-install)."
@@ -350,7 +351,7 @@ uninstall_main() {
     rmdir "${INSTALL_DIR}/scripts" 2>/dev/null || true
     say "Removed zsh integration files from ${INSTALL_DIR}"
     say "libflyline was left in place for Bash users; remove ${INSTALL_DIR}/libflyline.so (or .dylib) manually if unused."
-    say "Restart zsh or run: unfunction flyline_enable flyline_disable flyline_uninstall _flyline_edit 2>/dev/null"
+    say "Restart zsh or run: unfunction flyline flyline_enable flyline_disable flyline_uninstall _flyline_edit 2>/dev/null"
 }
 
 # ---------------------------------------------------------------------------

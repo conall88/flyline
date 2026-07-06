@@ -394,7 +394,10 @@ impl ZshBackend {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("completion daemon not initialized"))?;
         let output = daemon.capture(buffer_at_cursor)?;
-        Ok((parse_capture_output(&output), capture_has_completer(&output)))
+        Ok((
+            parse_capture_output(&output),
+            capture_has_completer(&output),
+        ))
     }
 }
 
@@ -706,6 +709,39 @@ impl ShellBackend for ZshBackend {
 
     fn shell_pgrp(&self) -> libc::pid_t {
         unsafe { libc::getpgrp() }
+    }
+
+    /// This host spawns a fresh process per prompt, so settings changed via
+    /// `flyline <subcommand>` are persisted to a config file rather than kept in
+    /// a live builtin. Uses `$XDG_CONFIG_HOME/flyline/settings.json`, falling back
+    /// to `~/.config/flyline/settings.json`.
+    fn persisted_settings_path(&self) -> Option<std::path::PathBuf> {
+        let base = std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"))
+            })?;
+        Some(base.join("flyline").join("settings.json"))
+    }
+
+    /// Transient tutorial state is scoped to the terminal session so it never
+    /// leaks into other terminals or outlives this one, matching how the Bash
+    /// builtin keeps it live in its per-terminal process. The session is keyed
+    /// by the POSIX session id (stable across this terminal's per-prompt
+    /// processes, distinct per terminal window). Stored under
+    /// `$XDG_RUNTIME_DIR/flyline/` (falling back to the system temp dir).
+    fn session_state_path(&self) -> Option<std::path::PathBuf> {
+        // SAFETY: getsid is a simple, thread-safe syscall with no preconditions.
+        let sid = unsafe { libc::getsid(0) };
+        if sid <= 0 {
+            return None;
+        }
+        let base = std::env::var_os("XDG_RUNTIME_DIR")
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        Some(base.join("flyline").join(format!("session-{sid}.json")))
     }
 }
 
@@ -1704,7 +1740,9 @@ mod tests {
         // A command with no registered completer must not report one — that's the
         // signal that keeps flyline from offering flycomp only when nothing exists.
         let mut stream = connect().expect("connect for unknown-cmd capture");
-        stream.set_read_timeout(Some(BROKER_REQUEST_TIMEOUT)).unwrap();
+        stream
+            .set_read_timeout(Some(BROKER_REQUEST_TIMEOUT))
+            .unwrap();
         stream
             .write_all(format!("{}\nzzznosuchcmd_flytest \n", cwd.display()).as_bytes())
             .unwrap();

@@ -134,6 +134,126 @@ pub trait ShellBackend: Sync {
 
     /// Process group ID of the shell (used in shell-integration OSC sequences).
     fn shell_pgrp(&self) -> libc::pid_t;
+
+    // ── Settings persistence (ephemeral, per-prompt hosts only) ──────────
+    //
+    // These exist ONLY for hosts that run flyline as a fresh process on every
+    // prompt (e.g. the standalone editor), which therefore need a settings
+    // snapshot on disk to survive across invocations. The Bash builtin is
+    // long-lived and keeps its settings live in-process, so it deliberately
+    // does NOT participate: it leaves `persisted_settings_path()` at the
+    // default `None`, which makes load return defaults and persist a no-op.
+    // Do not wire the Bash builtin into this path.
+
+    /// Path to the on-disk settings snapshot for a per-prompt host, or `None`
+    /// for hosts (like Bash) that keep settings live in-process and never
+    /// persist. Returning `None` disables `load_persisted_settings` /
+    /// `persist_settings` entirely.
+    fn persisted_settings_path(&self) -> Option<PathBuf> {
+        None
+    }
+
+    /// Load a per-prompt host's persisted settings, overlaying the on-disk
+    /// snapshot (if any) onto the defaults. With no path (e.g. Bash), or a
+    /// missing/unreadable file, this returns `Settings::default()`.
+    fn load_persisted_settings(&self) -> crate::settings::Settings {
+        let Some(path) = self.persisted_settings_path() else {
+            return crate::settings::Settings::default();
+        };
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            return crate::settings::Settings::default();
+        };
+        match serde_json::from_str(&contents) {
+            Ok(settings) => settings,
+            Err(err) => {
+                log::warn!("Ignoring unreadable flyline settings at {path:?}: {err}");
+                crate::settings::Settings::default()
+            }
+        }
+    }
+
+    /// Persist a per-prompt host's `settings` snapshot (a no-op for hosts, like
+    /// Bash, whose `persisted_settings_path()` is `None`).
+    /// Best-effort and fail-open: any error is logged, never propagated, so a
+    /// read-only or full disk can never break the prompt.
+    fn persist_settings(&self, settings: &crate::settings::Settings) {
+        let Some(path) = self.persisted_settings_path() else {
+            return;
+        };
+        if let Some(parent) = path.parent()
+            && let Err(err) = std::fs::create_dir_all(parent)
+        {
+            log::warn!("Could not create flyline settings dir {parent:?}: {err}");
+            return;
+        }
+        match serde_json::to_string_pretty(settings) {
+            Ok(json) => {
+                if let Err(err) = std::fs::write(&path, json) {
+                    log::warn!("Could not write flyline settings to {path:?}: {err}");
+                }
+            }
+            Err(err) => log::warn!("Could not serialize flyline settings: {err}"),
+        }
+    }
+
+    // ── Session state (transient, per-terminal, per-prompt hosts only) ───
+    //
+    // Distinct from the durable settings snapshot above: this carries state
+    // that must survive across a single terminal's per-prompt processes but
+    // must NOT leak to other terminals or persist after the terminal closes —
+    // most notably the interactive tutorial. The path is therefore scoped to
+    // the terminal session, not to global config. The long-lived Bash builtin
+    // keeps this state live in-process and opts out (default `None`).
+
+    /// Path to the on-disk session-state file for a per-prompt host, scoped to
+    /// the current terminal session, or `None` for hosts (like Bash) that keep
+    /// session state live in-process. Returning `None` makes load return the
+    /// default and persist a no-op.
+    fn session_state_path(&self) -> Option<PathBuf> {
+        None
+    }
+
+    /// Load this terminal session's transient state (e.g. tutorial progress).
+    /// With no path (e.g. Bash) or a missing/unreadable file, returns the
+    /// default (tutorial not running).
+    fn load_session_state(&self) -> crate::settings::SessionState {
+        let Some(path) = self.session_state_path() else {
+            return crate::settings::SessionState::default();
+        };
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            return crate::settings::SessionState::default();
+        };
+        serde_json::from_str(&contents).unwrap_or_default()
+    }
+
+    /// Persist this terminal session's transient `state`. A no-op for hosts
+    /// (like Bash) with no `session_state_path()`. When the state is empty
+    /// (tutorial finished), the backing file is removed rather than left as a
+    /// stale marker. Best-effort and fail-open: errors are logged, never
+    /// propagated, so they can't break the prompt.
+    fn persist_session_state(&self, state: &crate::settings::SessionState) {
+        let Some(path) = self.session_state_path() else {
+            return;
+        };
+        if state.is_empty() {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        if let Some(parent) = path.parent()
+            && let Err(err) = std::fs::create_dir_all(parent)
+        {
+            log::warn!("Could not create flyline session dir {parent:?}: {err}");
+            return;
+        }
+        match serde_json::to_string(state) {
+            Ok(json) => {
+                if let Err(err) = std::fs::write(&path, json) {
+                    log::warn!("Could not write flyline session state to {path:?}: {err}");
+                }
+            }
+            Err(err) => log::warn!("Could not serialize flyline session state: {err}"),
+        }
+    }
 }
 
 /// The original Bash host; delegates to `bash_funcs`, adding no new behavior.
@@ -577,5 +697,104 @@ mod tests {
     #[test]
     fn default_backend_delegates_shell_pgrp() {
         assert_eq!(backend().shell_pgrp(), read_shell_pgrp());
+    }
+
+    #[test]
+    fn bash_backend_does_not_persist_settings() {
+        // Bash keeps settings live in the builtin, so the persistence seam is
+        // inert: no path, load yields defaults, persist is a no-op that never writes.
+        assert!(BashBackend.persisted_settings_path().is_none());
+        BashBackend.persist_settings(&crate::settings::Settings::default());
+        assert!(!BashBackend.load_persisted_settings().run_tutorial);
+    }
+
+    #[test]
+    fn zsh_backend_settings_round_trip() {
+        let dir =
+            std::env::temp_dir().join(format!("flyline_settings_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // SAFETY: no other test reads XDG_CONFIG_HOME; it is restored at the end.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        }
+
+        let path = zsh::ZSH_BACKEND
+            .persisted_settings_path()
+            .expect("per-prompt host has a settings path");
+        assert!(path.starts_with(&dir));
+
+        // No file yet -> defaults.
+        assert_eq!(
+            zsh::ZSH_BACKEND
+                .load_persisted_settings()
+                .num_suggestion_rows,
+            crate::settings::Settings::default().num_suggestion_rows
+        );
+
+        let mut s = crate::settings::Settings::default();
+        s.num_suggestion_rows = 33;
+        zsh::ZSH_BACKEND.persist_settings(&s);
+        assert!(path.exists(), "persist_settings should create the snapshot");
+
+        let back = zsh::ZSH_BACKEND.load_persisted_settings();
+        assert_eq!(back.num_suggestion_rows, 33);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+    }
+
+    #[test]
+    fn zsh_backend_session_state_round_trip() {
+        // Route the session file into a throwaway XDG_RUNTIME_DIR so the test
+        // is hermetic and never touches a real session.
+        let dir = std::env::temp_dir().join(format!("flyline_session_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // SAFETY: no other test reads XDG_RUNTIME_DIR; it is restored at the end.
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", &dir);
+        }
+
+        let path = zsh::ZSH_BACKEND
+            .session_state_path()
+            .expect("per-prompt host has a session-state path");
+        assert!(path.starts_with(&dir));
+
+        // No file yet -> tutorial not running.
+        assert!(!zsh::ZSH_BACKEND.load_session_state().run_tutorial);
+
+        // An active tutorial is persisted and read back.
+        let state = crate::settings::SessionState {
+            run_tutorial: true,
+            tutorial_step: crate::tutorial::TutorialStep::Welcome,
+        };
+        zsh::ZSH_BACKEND.persist_session_state(&state);
+        assert!(path.exists(), "active session state should be written");
+        let back = zsh::ZSH_BACKEND.load_session_state();
+        assert!(back.run_tutorial);
+        assert_eq!(back.tutorial_step, crate::tutorial::TutorialStep::Welcome);
+
+        // A finished tutorial removes the file rather than leaving a stale marker.
+        zsh::ZSH_BACKEND.persist_session_state(&crate::settings::SessionState::default());
+        assert!(!path.exists(), "empty session state should remove the file");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
+    }
+
+    #[test]
+    fn bash_backend_does_not_persist_session_state() {
+        // Bash keeps tutorial state live in the builtin; the session seam is inert.
+        assert!(BashBackend.session_state_path().is_none());
+        BashBackend.persist_session_state(&crate::settings::SessionState {
+            run_tutorial: true,
+            ..Default::default()
+        });
+        assert!(!BashBackend.load_session_state().run_tutorial);
     }
 }
