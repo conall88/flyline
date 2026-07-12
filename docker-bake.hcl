@@ -30,6 +30,13 @@ variable "LOCAL_ASSET_VERSION" {
     default = "v0.0.0-local"
 }
 
+# Target name used for locally packaged release assets. Override this on native
+# ARM hosts so the archive name matches install.sh's detected target:
+#   LOCAL_ASSET_TARGET=aarch64-unknown-linux-gnu docker buildx bake ...
+variable "LOCAL_ASSET_TARGET" {
+    default = "x86_64-unknown-linux-gnu"
+}
+
 # In-image directory the install-test Dockerfiles copy local assets into.
 variable "LOCAL_ASSET_DIR" {
     default = "/opt/flyline-assets"
@@ -73,7 +80,7 @@ target "build-release-assets" {
     output = ["type=local,dest=docker/build-release-assets"]
     args = {
         FLYLINE_INSTALL_VERSION = LOCAL_ASSET_VERSION
-        RELEASE_TARGET = "x86_64-unknown-linux-gnu"
+        RELEASE_TARGET = LOCAL_ASSET_TARGET
     }
 }
 

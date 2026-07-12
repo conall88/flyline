@@ -24,3 +24,12 @@ RUN FLYLINE_REPO="${FLYLINE_REPO}" \
     sh /tmp/flyline-install.sh
 
 RUN /bin/bash -i -c "flyline --version"
+
+# A full uninstall removes the Bash startup line and all packaged binaries,
+# libraries, scripts, and release metadata.
+RUN set -eux; \
+    sh /tmp/flyline-install.sh --uninstall; \
+    ! grep -q "enable -f .*libflyline.* flyline" "${HOME}/.bashrc"; \
+    test ! -e "${HOME}/.local/lib/libflyline.so"; \
+    test ! -e "${HOME}/.local/lib/flyline-standalone"; \
+    test ! -e "${HOME}/.local/lib/UPSTREAM_BASE.toml"

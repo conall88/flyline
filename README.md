@@ -43,22 +43,23 @@ Flyline is similar to [ble.sh](https://github.com/akinomyoga/ble.sh) but is writ
 > [!IMPORTANT]
 > After installing, run `flyline run-tutorial` and if you don't like the mouse capturing: `flyline mouse --mode disabled`
 
-### Install the latest release (recommended)
+### Quick install
 
-> [!TIP]
-> The release installer selects the correct archive, verifies its checksum, and
-> configures every supported shell it detects. No `sudo` is required.
+Run the installer from the latest stable release:
 
 ```bash
 curl -sSfL https://github.com/conall88/flyline-multishell/releases/latest/download/install.sh | sh
 ```
-You can also choose a specific version or inspect its assets on the
-[releases page](https://github.com/conall88/flyline-multishell/releases).
+
+The installer selects the correct archive, verifies its checksum, and
+configures Bash and zsh when available. No `sudo` is required. See the
+[releases page](https://github.com/conall88/flyline-multishell/releases) for
+specific versions and release notes.
 
 On macOS, zsh works with the system shell. To use the Bash builtin too, install
 a newer Bash that supports custom builtins: `brew install bash`.
 
-### Zsh
+#### Zsh integration details
 
 The same `install.sh` also sets up zsh when `zsh` is on your `PATH`: it installs `flyline-standalone` and `libflyline.so` under `~/.local/lib` (or `FLYLINE_INSTALL_DIR`), drops `scripts/flyline.zsh` there, and adds a guarded block to `~/.zshrc`:
 
@@ -81,14 +82,15 @@ flyline_disable   # restore native ZLE for this session
 **Uninstall:**
 
 ```zsh
-flyline_uninstall   # disable flyline and unset FLYLINE_BIN in this session
+flyline_uninstall   # disable flyline and unset FLYLINE_BIN in this zsh session
 ```
 
 ```sh
-sh install.sh --uninstall   # remove the ~/.zshrc block, flyline-standalone, and scripts/flyline.zsh
+sh install.sh --uninstall   # remove installed files plus Bash and zsh startup integration
 ```
 
-`libflyline.so` is kept for Bash; remove it manually if you no longer use flyline with Bash.
+The script reports exactly what it removed. Restart existing shells (or run the
+commands it prints) to unload commands that are already in memory.
 
 **Fail-open:** flyline runs as a separate process from a `zle-line-init` hook. If the binary is missing, you cancel, or flyline crashes, zsh falls back to native line editing for that line — your shell keeps working.
 
@@ -96,7 +98,7 @@ sh install.sh --uninstall   # remove the ~/.zshrc block, flyline-standalone, and
 
 **`FLYLINE_ZSH_NO_RCS=1`** makes flyline's helper shells skip your `~/.zshrc` (a pristine `zsh -f`). Boot is faster and more predictable, but you lose user/plugin completions (only system `fpath` completions remain). Use it if a heavy prompt framework misbehaves headlessly.
 
-#### Zsh limitations
+##### Zsh limitations
 
 - **History is file-mediated.** The widget runs `fc -AI` to flush the current session's history to `$HISTFILE` before launching flyline, which then reads the file — recent commands are visible, but this is not a live read of the parent shell's in-memory list.
 - **One-time rc boot cost.** Loading a heavy `~/.zshrc` (e.g. powerlevel10k) adds ~1–2s when the completion daemon first starts; the persistent daemon amortizes it across the session. `FLYLINE_ZSH_NO_RCS=1` avoids it.
@@ -104,55 +106,48 @@ sh install.sh --uninstall   # remove the ~/.zshrc block, flyline-standalone, and
 
 ### Arch Linux
 
-Arch users can install the [AUR package](https://aur.archlinux.org/packages/flyline):
+The existing [`flyline` AUR package](https://aur.archlinux.org/packages/flyline)
+currently tracks the upstream Bash-only project, not `flyline-multishell`.
+Until a fork-specific AUR package is available, use the
+[quick install](#quick-install) above to install this fork on Arch Linux.
 
-```bash
-paru -S flyline
-```
+### Download from releases
 
-### Manual installation from a release
+Download the archive and matching `.sha256` file for your target from the
+[releases page](https://github.com/conall88/flyline-multishell/releases).
+Each archive includes both the Bash loadable library and the zsh standalone
+binary and integration script.
 
-Each release provides a `libflyline-multishell-vX.Y.Z-<target>.tar.gz` archive
-and matching `.sha256` file. Download both from the
-[releases page](https://github.com/conall88/flyline-multishell/releases), verify
-the checksum, and extract the archive into a directory such as
-`~/.local/lib`. On Linux, choose a `gnu` target unless you use a `musl`-based
-distribution such as Alpine or Chimera.
+After extracting it:
 
-The same archive supports both shells:
+- Bash: load the versioned `libflyline.so` (`libflyline.dylib` on macOS) with
+  `enable -f /path/to/library flyline`.
+- zsh: set `FLYLINE_BIN` to the extracted `flyline-standalone` binary and
+  source the extracted `scripts/flyline.zsh`.
 
-- `libflyline.so.X.Y.Z` (or `libflyline.dylib.X.Y.Z` on macOS) is the Bash
-  loadable builtin.
-- `flyline-standalone` and `scripts/flyline.zsh` provide the zsh integration.
-
-For Bash, load the extracted versioned library from `.bashrc` or the current
-session:
-
-```bash
-enable -f "$HOME/.local/lib/libflyline.so.X.Y.Z" flyline
-flyline run-tutorial
-```
-
-For zsh, make the standalone binary executable and add the integration to
-`.zshrc`:
-
-```zsh
-chmod +x "$HOME/.local/lib/flyline-standalone"
-export FLYLINE_BIN="$HOME/.local/lib/flyline-standalone"
-[[ -r "$HOME/.local/lib/scripts/flyline.zsh" ]] && . "$HOME/.local/lib/scripts/flyline.zsh"
-flyline run-tutorial
-```
-
-The installer above performs these steps automatically and is the preferred
-way to install or upgrade from a release.
-
+For automatic target selection, checksum verification, and shell
+configuration, prefer the [quick install](#quick-install).
 
 ### Build from source
 
-Clone the repo and run:
+Clone the repository and build both the Bash library and standalone zsh binary:
+
 ```bash
-cargo build
+cargo build --features standalone
+```
+
+For Bash:
+
+```bash
 enable -f /path/to/flyline_checkout/target/debug/libflyline.so flyline
+flyline run-tutorial
+```
+
+For zsh:
+
+```zsh
+export FLYLINE_BIN=/path/to/flyline_checkout/target/debug/flyline-standalone
+source /path/to/flyline_checkout/scripts/flyline.zsh
 flyline run-tutorial
 ```
 

@@ -2,6 +2,11 @@ pub(crate) const CHANGELOG: &str = r#"# Changelog
 
 # flyline-multishell fork
 
+## v1.0.1
+- **Complete Uninstall**: `install.sh --uninstall` now removes both Bash and zsh startup integration along with installed executables, libraries, scripts, and release metadata.
+- **Clear Uninstall Guidance**: The installer reports exactly what it removed and explains how to unload commands already resident in existing Bash and zsh sessions.
+- **Installation Documentation**: Restored concise quick-install, Arch Linux, release-download, and source-build options with multishell-specific guidance.
+
 ## v1.0.0
 - **Zsh Support**: Added first-class Zsh integration via a `zle-line-init` hook that launches flyline as a separate process, with fail-open fallback to native ZLE when the binary is missing or flyline is cancelled/crashes.
 - **Standalone Binary**: Introduced the `flyline-standalone` executable so flyline's line editor can run outside the in-process Bash builtin, driving both Bash and Zsh from one codebase.

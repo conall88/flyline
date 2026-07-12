@@ -33,6 +33,7 @@ else
 fi
 BASHRC="${HOME}/.bashrc"
 ZSHRC="${HOME}/.zshrc"
+FLYLINE_BASHRC_MARKER="# Flyline - enhanced Bash experience"
 FLYLINE_ZSHRC_START="# >>> flyline start >>>"
 FLYLINE_ZSHRC_END="# <<< flyline end <<<"
 STANDALONE_BIN="flyline-standalone"
@@ -348,6 +349,30 @@ remove_zshrc_flyline_block() {
     say "Removed flyline block from ${ZSHRC}"
 }
 
+remove_bashrc_flyline_lines() {
+    if [ ! -f "$BASHRC" ]; then
+        return
+    fi
+
+    bash_enable_so="enable -f ${INSTALL_DIR}/libflyline.so flyline"
+    bash_enable_dylib="enable -f ${INSTALL_DIR}/libflyline.dylib flyline"
+    if ! grep -qF "$FLYLINE_BASHRC_MARKER" "$BASHRC" \
+        && ! grep -qF "$bash_enable_so" "$BASHRC" \
+        && ! grep -qF "$bash_enable_dylib" "$BASHRC"; then
+        return
+    fi
+
+    tmp="$(mktemp "${TMPDIR:-/tmp}/flyline.bashrc.XXXXXX")"
+    awk \
+        -v marker="$FLYLINE_BASHRC_MARKER" \
+        -v enable_so="$bash_enable_so" \
+        -v enable_dylib="$bash_enable_dylib" '
+        $0 != marker && $0 != enable_so && $0 != enable_dylib { print }
+    ' "$BASHRC" > "$tmp"
+    mv "$tmp" "$BASHRC"
+    say "Removed flyline startup lines from ${BASHRC}"
+}
+
 # Install from locally-built artifacts (cargo build) instead of a release
 # download. Symlinks the built binary/lib and the checkout's widget script into
 # INSTALL_DIR, then wires up ~/.zshrc — so rebuilds are picked up automatically.
@@ -413,13 +438,48 @@ local_main() {
 }
 
 uninstall_main() {
-    say "Uninstalling flyline zsh integration..."
+    say "Uninstalling flyline..."
     remove_zshrc_flyline_block
-    rm -f "${INSTALL_DIR}/${STANDALONE_BIN}" "${INSTALL_DIR}/scripts/flyline.zsh"
+    remove_bashrc_flyline_lines
+
+    # These generically named license files are part of the release archive.
+    # Only remove them when the adjacent flyline provenance file confirms this
+    # directory contains a packaged flyline installation.
+    remove_release_metadata=false
+    if [ -f "${INSTALL_DIR}/UPSTREAM_BASE.toml" ]; then
+        remove_release_metadata=true
+    fi
+
+    removed_files=false
+    for path in \
+        "${INSTALL_DIR}/${STANDALONE_BIN}" \
+        "${INSTALL_DIR}/scripts/flyline.zsh" \
+        "${INSTALL_DIR}/libflyline.so" \
+        "${INSTALL_DIR}"/libflyline.so.* \
+        "${INSTALL_DIR}/libflyline.dylib" \
+        "${INSTALL_DIR}"/libflyline.dylib.* \
+        "${INSTALL_DIR}/UPSTREAM_BASE.toml"; do
+        if [ -e "$path" ] || [ -L "$path" ]; then
+            rm -f "$path"
+            removed_files=true
+        fi
+    done
+    if $remove_release_metadata; then
+        rm -f "${INSTALL_DIR}/LICENSE-MIT" "${INSTALL_DIR}/LICENSE-GPLv3"
+    fi
     rmdir "${INSTALL_DIR}/scripts" 2>/dev/null || true
-    say "Removed zsh integration files from ${INSTALL_DIR}"
-    say "libflyline was left in place for Bash users; remove ${INSTALL_DIR}/libflyline.so (or .dylib) manually if unused."
-    say "Restart zsh or run: unfunction flyline flyline_enable flyline_disable flyline_uninstall _flyline_edit 2>/dev/null"
+    if $removed_files; then
+        say "Removed flyline executables, libraries, integration script, and release metadata from ${INSTALL_DIR}"
+    else
+        say "No installed flyline files were found in ${INSTALL_DIR}"
+    fi
+
+    say ""
+    say "Uninstall complete. Existing shells keep already-loaded commands until they are restarted."
+    say "    zsh: open a new terminal, or run:"
+    say "         unfunction flyline flyline_enable flyline_disable flyline_uninstall _flyline_edit 2>/dev/null"
+    say "    Bash: open a new terminal, or run:"
+    say "          enable -d flyline"
 }
 
 # ---------------------------------------------------------------------------
@@ -583,7 +643,7 @@ main() {
     if $install_bash_integration; then
         ENABLE_CMD="enable -f ${LIB_PATH} flyline"
         if [ -z "${FLYLINE_VERSION:-}" ]; then
-            printf '\n# Flyline - enhanced Bash experience\n%s\n' "$ENABLE_CMD" >> "$BASHRC"
+            printf '\n%s\n%s\n' "$FLYLINE_BASHRC_MARKER" "$ENABLE_CMD" >> "$BASHRC"
             say "Added flyline to ${BASHRC}"
         else
             say "Flyline is already installed (detected ${FLYLINE_VERSION}); skipping .bashrc modification."

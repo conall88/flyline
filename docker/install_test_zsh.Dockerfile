@@ -40,3 +40,14 @@ RUN set -eux; \
     FLYLINE_ZSH="${INSTALL_DIR}/scripts/flyline.zsh" \
     FLYLINE_BIN="${INSTALL_DIR}/flyline-standalone" \
     /opt/flyline/test.sh
+
+# Confirm the same installer cleanly removes both shell integrations and all
+# packaged flyline files after the functional checks complete.
+RUN set -eux; \
+    sh /tmp/flyline-install.sh --uninstall; \
+    ! grep -qF "# >>> flyline start >>>" "${HOME}/.zshrc"; \
+    ! grep -q "enable -f .*libflyline.* flyline" "${HOME}/.bashrc"; \
+    test ! -e "${HOME}/.local/lib/flyline-standalone"; \
+    test ! -e "${HOME}/.local/lib/scripts/flyline.zsh"; \
+    test ! -e "${HOME}/.local/lib/libflyline.so"; \
+    test ! -e "${HOME}/.local/lib/UPSTREAM_BASE.toml"
