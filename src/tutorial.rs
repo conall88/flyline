@@ -837,7 +837,10 @@ pub fn generate_tutorial_text(
                     ClipboardTypes::TutorialRunHelp,
                 ),
                 TaggedSpan::new(
-                    Span::styled(" and https://github.com/HalFrgrd/flyline.", text_style),
+                    Span::styled(
+                        " and https://github.com/conall88/flyline-multishell.",
+                        text_style,
+                    ),
                     Tag::Tutorial,
                 ),
             ]));

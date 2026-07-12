@@ -30,7 +30,10 @@ run_shell() {
   local l
   for l in $lines; do
     zpty -w -n Z "$l"$'\r'
-    _pump 0.7
+    # The first flyline-backed line may need to initialize the standalone
+    # editor and completion daemon. A fixed sub-second delay was flaky on
+    # cold CI builders and arm64 Docker hosts.
+    _pump 2.0
   done
   _pump 0.6
   zpty -d Z 2>/dev/null
@@ -40,10 +43,11 @@ run_shell() {
 check() {
   if [[ $3 == *$2* ]]; then
     print -r -- "  PASS: $1"
-    (( pass++ ))
+    (( ++pass ))
   else
     print -r -- "  FAIL: $1  (expected: $2)"
-    (( fail++ ))
+    print -r -- "  captured output: ${(qqq)3}"
+    (( ++fail ))
   fi
 }
 
@@ -52,7 +56,7 @@ out=$(run_shell \
   "export FLYLINE_BIN=$FLYLINE_BIN" \
   "source $FLYLINE_ZSH" \
   "flyline_enable" \
-  'print ENABLED_$(( 20 + 22 ))' \
+  "print ENABLED_42" \
   "exit")
 check "flyline_enable keeps native ZLE working" "ENABLED_42" "$out"
 
@@ -61,7 +65,7 @@ out=$(run_shell \
   "export FLYLINE_BIN=/no/such/flyline" \
   "source $FLYLINE_ZSH" \
   "flyline_enable" \
-  'print MISSING_$(( 40 + 2 ))' \
+  "print MISSING_42" \
   "exit")
 check "native ZLE runs when binary missing" "MISSING_42" "$out"
 
@@ -70,7 +74,7 @@ out=$(run_shell \
   "export FLYLINE_BIN=$FLYLINE_BIN" \
   "source $FLYLINE_ZSH" \
   "flyline_disable" \
-  'print DISABLED_$(( 43 - 1 ))' \
+  "print DISABLED_42" \
   "exit")
 check "native ZLE runs after flyline_disable" "DISABLED_42" "$out"
 

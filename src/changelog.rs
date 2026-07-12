@@ -1,5 +1,15 @@
 pub(crate) const CHANGELOG: &str = r#"# Changelog
 
+# flyline-multishell fork
+
+## v1.0.0
+- **Zsh Support**: Added first-class Zsh integration via a `zle-line-init` hook that launches flyline as a separate process, with fail-open fallback to native ZLE when the binary is missing or flyline is cancelled/crashes.
+- **Standalone Binary**: Introduced the `flyline-standalone` executable so flyline's line editor can run outside the in-process Bash builtin, driving both Bash and Zsh from one codebase.
+- **Multishell**: Unified Bash and Zsh under a single multishell architecture, reusing your existing shell setup (e.g. `~/.zshrc`, `compinit` functions, oh-my-zsh plugins) for completions rather than reinventing them.
+- **flycomp Option Synthesis**: Extended automatic completion synthesis so flycomp-generated option/flag specs are surfaced as suggestions when a command lacks a native completion script.
+
+# Upstream (HalFrgrd/flyline)
+
 ## v1.3.0
 - **Leader Keys**: Added support for chorded keybinding sequences (e.g., `Ctrl+x` followed by `Ctrl+f`) via the new `setLeaderKey` and `unsetLeaderKey` actions and the `leaderKeyActive` context variable.
 - **Leader Key Visual Feedback**: Introduced the `leader-mode` prompt widget to display visual indicators (like ` X `) in the prompt when the leader key state is active.

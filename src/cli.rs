@@ -71,7 +71,7 @@ fn parse_effect_speed(s: &str) -> Result<f32, String> {
 #[command(
     name = "flyline",
     styles = get_styles(),
-    after_help = "Read more at https://github.com/HalFrgrd/flyline",
+    after_help = "Read more at https://github.com/conall88/flyline-multishell",
 )]
 struct FlylineArgs {
     /// Show version information
@@ -341,7 +341,7 @@ enum Commands {
     ///     --command 'copilot --reasoning-effort low --prompt'
     ///   flyline set-agent-mode --trigger-prefix ": " --command 'copilot --reasoning-effort low --prompt'
     ///
-    /// See https://github.com/HalFrgrd/flyline/blob/master/examples/agent_mode.sh for more details and example usage.
+    /// See https://github.com/conall88/flyline-multishell/blob/master/examples/agent_mode.sh for more details and example usage.
     #[command(name = "set-agent-mode", verbatim_doc_comment)]
     AgentMode {
         /// Optional system prompt prepended to the buffer.
@@ -798,7 +798,7 @@ enum PromptWidgetSubcommands {
     ///   flyline create-prompt-widget animation --name "MY_ANIMATION" --fps 10  ⣾ ⣷ ⣯ ⣟ ⡿ ⢿ ⣻ ⣽
     ///   flyline create-prompt-widget animation --name "john" --ping-pong --fps 5  '\e[33m\u' '\e[31m\u' '\e[35m\u' '\e[36m\u'
     ///
-    /// See https://github.com/HalFrgrd/flyline/blob/master/examples/animations.sh for more details and example usage.
+    /// See https://github.com/conall88/flyline-multishell/blob/master/examples/animations.sh for more details and example usage.
     #[command(name = "animation", verbatim_doc_comment)]
     Animation {
         /// Name to embed in prompt strings as the animation placeholder.
@@ -1646,9 +1646,9 @@ pub fn run_flyline_command(cfg: &mut settings::Settings, args: &[&str]) -> c_int
                 Some(Commands::Upgrade) => {
                     println!("Flyline is a purely offline piece of software. Please run:");
                     println!(
-                        "curl -sSfL https://github.com/HalFrgrd/flyline/releases/latest/download/install.sh | sh"
+                        "curl -sSfL https://github.com/conall88/flyline-multishell/releases/latest/download/install.sh | sh"
                     );
-                    cfg.initial_buffer = Some("curl -sSfL https://github.com/HalFrgrd/flyline/releases/latest/download/install.sh | sh".to_string());
+                    cfg.initial_buffer = Some("curl -sSfL https://github.com/conall88/flyline-multishell/releases/latest/download/install.sh | sh".to_string());
                 }
             }
 

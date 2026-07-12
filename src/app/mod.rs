@@ -1390,7 +1390,7 @@ impl<'a> App<'a> {
                     Some(cmd),
                 ),
                 None => (
-                    "Agent mode is not configured. Run `flyline set-agent-mode --help` or see https://github.com/HalFrgrd/flyline#agent-mode".to_string(),
+                    "Agent mode is not configured. Run `flyline set-agent-mode --help` or see https://github.com/conall88/flyline-multishell#agent-mode".to_string(),
                     setup_cmd,
                 )
             }

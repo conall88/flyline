@@ -1478,6 +1478,7 @@ mod tests {
         // ponytail: pty daemon can hang in CI/WSL; cap wait so `cargo test --lib` stays bounded.
         let backend = &ZSH_BACKEND;
         let (tx, rx) = std::sync::mpsc::channel();
+        #[allow(clippy::disallowed_methods)]
         std::thread::spawn(move || {
             let result = backend.run_programmable_completions("git ", "git", "", 4, 4);
             let _ = tx.send(result);
@@ -1551,6 +1552,7 @@ mod tests {
         let script_path = ZSH_BACKEND.daemon_script_path().to_path_buf();
         let zdotdir_str = zdotdir.to_str().unwrap().to_string();
         let (tx, rx) = std::sync::mpsc::channel();
+        #[allow(clippy::disallowed_methods)]
         std::thread::spawn(move || {
             let result =
                 spawn_comp_daemon_with_env(&script_path, &[("ZDOTDIR", zdotdir_str.as_str())])

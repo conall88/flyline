@@ -100,7 +100,7 @@ fn main() {
         Ok(code) => code,
         Err(()) => {
             eprintln!(
-                "flyline: panicked; please report at https://github.com/HalFrgrd/flyline/issues"
+                "flyline: panicked; please report at https://github.com/conall88/flyline-multishell/issues"
             );
             1
         }

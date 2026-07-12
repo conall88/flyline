@@ -1,11 +1,13 @@
 #!/bin/sh
 # Flyline installer
-# Usage: curl -sSfL https://github.com/HalFrgrd/flyline/releases/latest/download/install.sh | sh
+# Usage: curl -sSfL https://github.com/conall88/flyline-multishell/releases/latest/download/install.sh | sh
 #        sh install.sh --uninstall
 
 set -eu
 
 expand_path() {
+    # The quoted tilde is a literal config-path prefix, not shell expansion.
+    # shellcheck disable=SC2088
     case "$1" in
         '~/'*) echo "${HOME}/${1#~/}" ;;
         '~')   echo "${HOME}" ;;
@@ -13,7 +15,15 @@ expand_path() {
     esac
 }
 
-REPO="HalFrgrd/flyline"
+# Default release repo. Override with FLYLINE_REPO to install from a fork.
+REPO="${FLYLINE_REPO:-conall88/flyline-multishell}"
+# Optional asset source override. When set, release archives (and their
+# .sha256 files) are fetched from here instead of the GitHub release. It may be
+# an HTTP(S) base URL (e.g. http://localhost:8000/assets) or a local directory /
+# file:// base (e.g. /opt/flyline-assets or file:///opt/flyline-assets). This is
+# used by the Docker install tests to consume locally produced release assets;
+# normal GitHub-based installs leave it unset.
+FLYLINE_ASSET_BASE="${FLYLINE_ASSET_BASE:-}"
 if [ -n "${FLYLINE_INSTALL_DIR:-}" ]; then
     INSTALL_DIR="$(expand_path "$FLYLINE_INSTALL_DIR")"
 elif [ -n "${FLYLINE_LOAD_DIR:-}" ]; then
@@ -44,11 +54,40 @@ download() {
     url="$1"
     dest="$2"
     if command -v curl >/dev/null 2>&1; then
-        curl -sSfL -o "$dest" "$url"
+        curl -sSfL --retry 5 --retry-delay 2 --retry-connrefused -o "$dest" "$url"
     elif command -v wget >/dev/null 2>&1; then
         wget -qO "$dest" "$url"
     else
         err "Neither curl nor wget is available. Please install one and retry."
+    fi
+}
+
+# Fetch a named release asset into a destination path. Honors FLYLINE_ASSET_BASE
+# when set (HTTP(S) base URL, or local directory / file:// base), otherwise falls
+# back to the standard GitHub release download URL. Keeps normal GitHub behavior
+# unchanged for end users (FLYLINE_ASSET_BASE unset).
+fetch_asset() {
+    asset_name="$1"
+    dest="$2"
+    if [ -n "$FLYLINE_ASSET_BASE" ]; then
+        base="${FLYLINE_ASSET_BASE%/}"
+        src="${base}/${asset_name}"
+        case "$src" in
+            http://* | https://*)
+                download "$src" "$dest"
+                ;;
+            file://*)
+                path="${src#file://}"
+                [ -f "$path" ] || err "Asset not found at ${path} (FLYLINE_ASSET_BASE=${FLYLINE_ASSET_BASE})."
+                cp "$path" "$dest"
+                ;;
+            *)
+                [ -f "$src" ] || err "Asset not found at ${src} (FLYLINE_ASSET_BASE=${FLYLINE_ASSET_BASE})."
+                cp "$src" "$dest"
+                ;;
+        esac
+    else
+        download "https://github.com/${REPO}/releases/download/${VERSION}/${asset_name}" "$dest"
     fi
 }
 
@@ -74,6 +113,8 @@ get_latest_version() {
 detect_bash_version_parts() {
     bash_bin="$(command -v bash 2>/dev/null || true)"
     [ -n "$bash_bin" ] || { echo "0 0"; return; }
+    # Expanded by the Bash subprocess, not by this POSIX shell.
+    # shellcheck disable=SC2016
     "$bash_bin" -c 'echo "${BASH_VERSINFO[0]} ${BASH_VERSINFO[1]}"' 2>/dev/null || echo "0 0"
 }
 
@@ -95,6 +136,8 @@ is_system_bash_pre_4_4() {
 find_homebrew_bash() {
     for candidate in "/opt/homebrew/bin/bash" "/usr/local/bin/bash"; do
         if [ -x "$candidate" ]; then
+            # Expanded by the Bash subprocess, not by this POSIX shell.
+            # shellcheck disable=SC2016
             v="$("$candidate" -c 'echo "${BASH_VERSINFO[0]} ${BASH_VERSINFO[1]}"' 2>/dev/null || echo "0 0")"
             major="${v%% *}"; minor="${v##* }"
             if is_bash_version_4_4_or_later "$major" "$minor"; then
@@ -160,6 +203,42 @@ detect_libc() {
 }
 
 # ---------------------------------------------------------------------------
+# Release target support
+# ---------------------------------------------------------------------------
+#
+# Only the targets below have release archives built (see the release
+# workflow's build matrix). We reject unsupported combinations up front rather
+# than constructing download URLs that will 404.
+
+# Returns 0 (true) if a standard (non pre-Bash-4.4) archive is built for TARGET.
+is_supported_target() {
+    case "$1" in
+        x86_64-unknown-linux-gnu | \
+        x86_64-unknown-linux-musl | \
+        aarch64-unknown-linux-gnu | \
+        aarch64-unknown-linux-musl | \
+        armv7-unknown-linux-gnueabihf | \
+        i686-unknown-linux-gnu | \
+        riscv64gc-unknown-linux-gnu | \
+        powerpc64le-unknown-linux-gnu | \
+        x86_64-unknown-freebsd | \
+        x86_64-apple-darwin | \
+        aarch64-apple-darwin)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# Returns 0 (true) if a pre-Bash-4.4 archive is built for TARGET. Only the
+# x86_64 GNU Linux target ships a _pre_bash_4_4 build.
+is_supported_pre_bash_4_4_target() {
+    [ "$1" = "x86_64-unknown-linux-gnu" ]
+}
+
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Helpers for portability
@@ -201,27 +280,16 @@ backup_zshrc_if_needed() {
     say "Backed up ${ZSHRC} to ${ZSHRC}.flyline.bak.${ts}"
 }
 
+# Release installs ship scripts/flyline.zsh inside the archive, so it is already
+# present under INSTALL_DIR/scripts after extraction. Consume that packaged copy
+# directly (no unchecked raw.githubusercontent fallback). The --local flow links
+# the checkout's script separately in local_main().
 install_flyline_zsh_script() {
     dest="${INSTALL_DIR}/scripts/flyline.zsh"
-    mkdir -p "${INSTALL_DIR}/scripts"
-
-    if [ -f "./scripts/flyline.zsh" ]; then
-        cp "./scripts/flyline.zsh" "$dest"
+    if [ -f "$dest" ]; then
         return
     fi
-    if [ -n "${0:-}" ] && [ "$0" != "sh" ]; then
-        script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-        if [ -f "${script_dir}/scripts/flyline.zsh" ]; then
-            cp "${script_dir}/scripts/flyline.zsh" "$dest"
-            return
-        fi
-    fi
-
-    if [ -z "${VERSION:-}" ]; then
-        err "Cannot locate scripts/flyline.zsh (run install from a checkout or set FLYLINE_INSTALL_VERSION)."
-    fi
-    say "Downloading scripts/flyline.zsh..."
-    download "https://raw.githubusercontent.com/${REPO}/${VERSION}/scripts/flyline.zsh" "$dest"
+    err "Packaged scripts/flyline.zsh not found in ${INSTALL_DIR}/scripts. The release archive is expected to contain scripts/flyline.zsh."
 }
 
 install_zsh_integration() {
@@ -287,7 +355,7 @@ remove_zshrc_flyline_block() {
 local_main() {
     # Resolve the checkout dir (where scripts/ and target/ live).
     if [ -n "${0:-}" ] && [ "$0" != "sh" ]; then
-        REPO_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+        REPO_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
     else
         REPO_DIR="$(pwd)"
     fi
@@ -361,6 +429,7 @@ uninstall_main() {
 main() {
     OS="$(detect_os)"
     ARCH="$(detect_arch)"
+    install_bash_integration=true
 
     if is_system_bash_pre_4_4; then
         use_bash_pre_4_4=true
@@ -380,6 +449,11 @@ main() {
                 warn "Your system Bash is older than 4.4. This version won't have been compiled with custom plugin support."
                 warn "Ensure that you use $BREW_BASH for flyline."
                 use_bash_pre_4_4=false
+            elif has_zsh; then
+                warn "Stock macOS Bash cannot load the flyline builtin and no supported Homebrew Bash was found."
+                warn "Continuing with zsh-only installation; Bash integration will be skipped."
+                use_bash_pre_4_4=false
+                install_bash_integration=false
             else
                 err_no_exit "Your system Bash is older than 4.4. This version won't have been compiled with custom plugin support."
                 err_no_exit "Please install a newer Bash before trying to use flyline:"
@@ -411,9 +485,29 @@ main() {
 
     say "Detected target: ${TARGET}"
 
+    # Reject targets/combinations for which no release archive is built, rather
+    # than constructing a URL (or asset path) that cannot resolve.
+    if $use_bash_pre_4_4; then
+        if ! is_supported_pre_bash_4_4_target "$TARGET"; then
+            if has_zsh; then
+                warn "No pre-Bash-4.4 builtin is available for ${TARGET}."
+                warn "Continuing with zsh-only installation; install Bash >= 4.4 to enable Bash integration."
+                use_bash_pre_4_4=false
+                install_bash_integration=false
+            else
+                err "No pre-Bash-4.4 build is available for ${TARGET}. The _pre_bash_4_4 archive is only built for x86_64-unknown-linux-gnu. Install Bash >= 4.4 to use flyline on this platform."
+            fi
+        fi
+    fi
+    if ! $use_bash_pre_4_4 && ! is_supported_target "$TARGET"; then
+        err "No release archive is built for target ${TARGET} (unsupported architecture/libc combination)."
+    fi
+
     if [ -n "${FLYLINE_INSTALL_VERSION:-}" ]; then
         say "Using specified release version: ${FLYLINE_INSTALL_VERSION}"
         VERSION="${FLYLINE_INSTALL_VERSION}"
+    elif [ -n "$FLYLINE_ASSET_BASE" ]; then
+        err "FLYLINE_ASSET_BASE is set but no version was specified. Set FLYLINE_INSTALL_VERSION to the version of the assets in ${FLYLINE_ASSET_BASE}."
     else
         say "Fetching latest release information..."
         VERSION="$(get_latest_version)"
@@ -431,33 +525,36 @@ main() {
         ARCHIVE_SHA256="${ARCHIVE}.sha256"
     fi
 
-    DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION}/${ARCHIVE}"
-    SHA256_URL="https://github.com/${REPO}/releases/download/${VERSION}/${ARCHIVE_SHA256}"
-
     TMP_DIR="$(mktemp -d)"
     # shellcheck disable=SC2064
     trap "rm -rf '$TMP_DIR'" EXIT
 
-    say "Downloading ${ARCHIVE} from
-    ${DOWNLOAD_URL}..."
-    download "$DOWNLOAD_URL" "${TMP_DIR}/${ARCHIVE}"
-
-    if [ -n "$SHA256_URL" ]; then
-        say "Downloading checksum from ${SHA256_URL}..."
-        download "$SHA256_URL" "${TMP_DIR}/${ARCHIVE_SHA256}"
-
-        say "Verifying checksum..."
-        # Run from TMP_DIR so the relative path in the checksum file resolves.
-        (cd "$TMP_DIR" && verify_sha256 "$ARCHIVE_SHA256") \
-            || err "Checksum verification failed for ${ARCHIVE}."
+    if [ -n "$FLYLINE_ASSET_BASE" ]; then
+        say "Fetching ${ARCHIVE} from asset base ${FLYLINE_ASSET_BASE}..."
+    else
+        say "Downloading ${ARCHIVE} from
+    https://github.com/${REPO}/releases/download/${VERSION}/${ARCHIVE}..."
     fi
+    fetch_asset "$ARCHIVE" "${TMP_DIR}/${ARCHIVE}"
+
+    say "Fetching checksum ${ARCHIVE_SHA256}..."
+    fetch_asset "$ARCHIVE_SHA256" "${TMP_DIR}/${ARCHIVE_SHA256}"
+
+    say "Verifying checksum..."
+    # Run from TMP_DIR so the relative path in the checksum file resolves.
+    (cd "$TMP_DIR" && verify_sha256 "$ARCHIVE_SHA256") \
+        || err "Checksum verification failed for ${ARCHIVE}."
 
 
     mkdir -p "$INSTALL_DIR"
 
     tar xzf "${TMP_DIR}/${ARCHIVE}" -C "$INSTALL_DIR"
 
-    VERSION_NO_V="${VERSION#v}"
+    case "$VERSION" in
+        multishell-v*) VERSION_NO_V="${VERSION#multishell-v}" ;;
+        v*)            VERSION_NO_V="${VERSION#v}" ;;
+        *)             VERSION_NO_V="$VERSION" ;;
+    esac
     LIB_VERSIONED="${LIB_NAME}.${VERSION_NO_V}"
 
     if [ -f "${INSTALL_DIR}/${LIB_VERSIONED}" ]; then
@@ -481,19 +578,24 @@ main() {
 
     install_zsh_integration
 
-    # Update or add 'enable -f ... flyline' in ~/.bashrc.
-    if [ -z "${FLYLINE_VERSION:-}" ]; then
+    # Update or add 'enable -f ... flyline' in ~/.bashrc when this platform's
+    # Bash can load the packaged builtin.
+    if $install_bash_integration; then
         ENABLE_CMD="enable -f ${LIB_PATH} flyline"
-        printf '\n# Flyline - enhanced Bash experience\n%s\n' "$ENABLE_CMD" >> "$BASHRC"
-        say "Added flyline to ${BASHRC}"
+        if [ -z "${FLYLINE_VERSION:-}" ]; then
+            printf '\n# Flyline - enhanced Bash experience\n%s\n' "$ENABLE_CMD" >> "$BASHRC"
+            say "Added flyline to ${BASHRC}"
+        else
+            say "Flyline is already installed (detected ${FLYLINE_VERSION}); skipping .bashrc modification."
+        fi
     else
-        say "Flyline is already installed (detected ${FLYLINE_VERSION}); skipping .bashrc modification."
+        say "Skipped Bash integration on this platform."
     fi
 
 
     # On macOS, login shells read ~/.bash_profile (not ~/.bashrc).
     # Warn the user if ~/.bash_profile does not appear to source ~/.bashrc.
-    if [ "$OS" = "darwin" ]; then
+    if [ "$OS" = "darwin" ] && $install_bash_integration; then
         BASH_PROFILE="${HOME}/.bash_profile"
         if [ -f "$BASH_PROFILE" ]; then
             if ! grep -qE '(source|\.)[[:space:]]+(~|\$\{?HOME\}?)/\.bashrc([[:space:]]|$)' "$BASH_PROFILE"; then
@@ -523,11 +625,13 @@ main() {
         fi
     else
         say "Installation complete!"
-        say '    To activate in the current shell:'
-        if [ -z "${FLYLINE_INSTALL_DIR:-}" ]; then
-            say "        $ENABLE_CMD"
-        else
-            say "        enable -d flyline && enable -f ${LIB_PATH} flyline"
+        if $install_bash_integration; then
+            say '    To activate in the current Bash shell:'
+            if [ -z "${FLYLINE_INSTALL_DIR:-}" ]; then
+                say "        $ENABLE_CMD"
+            else
+                say "        enable -d flyline && enable -f ${LIB_PATH} flyline"
+            fi
         fi
         if has_zsh && [ -f "${INSTALL_DIR}/${STANDALONE_BIN}" ]; then
             say '    For zsh, open a new terminal (or run: exec zsh).'

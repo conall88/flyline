@@ -1,4 +1,4 @@
-FROM ghcr.io/cross-rs/aarch64-unknown-linux-gnu:main-centos
+FROM ghcr.io/cross-rs/aarch64-unknown-linux-gnu:main-centos@sha256:f3136c38f3fc27d1364ca41b55c70f75b71fb76a9d039f9d44ae7a423f9acc85
 
 # Create a compatibility stdatomic.h for GCC 4.8.5
 RUN echo '#ifndef _COMPAT_STDATOMIC_H' > /usr/local/include/stdatomic.h && \

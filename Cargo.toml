@@ -1,7 +1,8 @@
 [package]
 name = "flyline"
-version = "1.3.0"
+version = "1.0.0"
 edition = "2024"
+repository = "https://github.com/conall88/flyline-multishell"
 
 [lints.clippy]
 disallowed_methods = "deny"
@@ -83,6 +84,20 @@ chrono = { version = "0.4" }
 dockerfile = "docker/cross/x86_64-unknown-linux-gnu.Dockerfile"
 [package.metadata.cross.target.aarch64-unknown-linux-gnu]
 dockerfile = "docker/cross/aarch64-unknown-linux-gnu.Dockerfile"
+[package.metadata.cross.target.x86_64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl:0.2.5@sha256:77db671d8356a64ae72a3e1415e63f547f26d374fbe3c4762c1cd36c7eac7b99"
+[package.metadata.cross.target.aarch64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl:0.2.5@sha256:702154f52b2d8091671aa2c84d5582d849f949977228c735ff8462f93cc0e1e4"
+[package.metadata.cross.target.armv7-unknown-linux-gnueabihf]
+image = "ghcr.io/cross-rs/armv7-unknown-linux-gnueabihf:0.2.5@sha256:4a08bebb60f08d52c1885b643a768f163c7318c05f91cf119f6c02855ea52699"
+[package.metadata.cross.target.i686-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/i686-unknown-linux-gnu:0.2.5@sha256:2647400f884dd399a3ce6f6d918fec0776d43e73f471f52e310cbe664ac1671f"
+[package.metadata.cross.target.riscv64gc-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/riscv64gc-unknown-linux-gnu:0.2.5@sha256:67ee97dd4719390d299edfcf39f226360ccfb1539e08b078ec187d4848415794"
+[package.metadata.cross.target.powerpc64le-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/powerpc64le-unknown-linux-gnu:0.2.5@sha256:de5114adcd786f6a41eb07379459aaae94de73670303e202ea3603d250c19091"
+[package.metadata.cross.target.x86_64-unknown-freebsd]
+image = "ghcr.io/cross-rs/x86_64-unknown-freebsd:0.2.5@sha256:a10c9fb4c82409147bdbec768518765d59bd11ac8675e63d6b09c089e834f5ec"
 
 [patch.crates-io]
 # Patch crates.io to point to the exact same git commit (78def95567c26a463d9f7554d48c3940d797a254) of our crossterm fork.
