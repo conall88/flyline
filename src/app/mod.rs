@@ -304,7 +304,19 @@ impl Drop for TabCompletionHandle {
 pub(crate) enum FlycompPromptSelection {
     Yes,
     No,
+    ShowFiles,
     DontAsk,
+}
+
+/// Completion results captured from zsh's generic `_default`/`_files` fallback.
+/// They are kept while the user decides whether flycomp should synthesize a
+/// command-specific completion, so declining synthesis never makes the files
+/// unreachable.
+#[derive(Debug)]
+pub(crate) struct PreservedTabCompletion {
+    pub builder: ActiveSuggestionsBuilder,
+    pub wuc_substring: SubString,
+    pub load_time: std::time::Duration,
 }
 
 #[derive(Debug)]
@@ -352,6 +364,7 @@ pub(crate) enum ContentMode {
         selection: FlycompPromptSelection,
         sandbox: Option<String>,
         dump_path: Option<String>,
+        fallback: Option<PreservedTabCompletion>,
     },
     TabCompletionRunningFlycomp {
         command_word: String,

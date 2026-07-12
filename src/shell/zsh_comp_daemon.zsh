@@ -66,15 +66,40 @@ fly-reload () {
 zle -N fly-reload
 bindkey '^G' fly-reload
 
-fly-begin () { compprefuncs=( fly-begin ); print -r -- '<<FLYBEGIN>>' }
-# fly-end reports whether a completion function is registered for the command
-# word ($_comps[cmd]) so Rust can tell "a completer ran but had nothing to add"
-# (e.g. `kubectl get` with no cluster -> stay silent) apart from "no completer
-# exists" (-> offer to synthesize one). Empty payload means no completer.
+# Report whether `_normal` would dispatch a command-specific route before the
+# generic `-default-` route. This deliberately mirrors its three `_set_command`
+# candidates and its direct, pattern, and post-pattern lookup tables. A
+# command-specific completer may itself call `_files`, so captured file matches
+# must not be used to infer this provenance.
+_fly_specific_command_route () {
+  local _comp_command1 _comp_command2 _comp_command candidate lookup
+  local -a matches
+  (( CURRENT > 1 )) || return
+  _set_command
+
+  for candidate in "$_comp_command" "$_comp_command1" "$_comp_command2"; do
+    [[ -n "$candidate" ]] || continue
+    lookup=${(Q)candidate}
+    [[ -n "${_comps[$lookup]}" ]] && return 0
+    matches=( "${(@)_patcomps[(K)$candidate]}" )
+    (( $#matches )) && return 0
+    matches=( "${(@)_postpatcomps[(K)$candidate]}" )
+    (( $#matches )) && return 0
+  done
+  return 1
+}
+
+fly-begin () {
+  compprefuncs=( fly-begin )
+  if _fly_specific_command_route; then
+    print -r -- '<<FLYSPECIFIC>>1'
+  else
+    print -r -- '<<FLYSPECIFIC>>0'
+  fi
+  print -r -- '<<FLYBEGIN>>'
+}
 fly-end () {
   comppostfuncs=( fly-end )
-  local -a __fly_words; __fly_words=( ${(z)BUFFER} )
-  print -r -- "<<FLYCOMPDEF>>${_comps[${__fly_words[1]}]}"
   print -r -- '<<FLYEND>>'
 }
 compprefuncs=( fly-begin )

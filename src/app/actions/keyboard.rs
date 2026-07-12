@@ -316,12 +316,20 @@ impl KeyEventAction {
             }
             KeyEventAction::FlycompAskToggleChoice => {
                 if let ContentMode::TabCompletionAskForFlycomp {
-                    ref mut selection, ..
+                    ref mut selection,
+                    ref fallback,
+                    ..
                 } = app.content_mode
                 {
+                    let show_files = fallback.is_some();
                     *selection = match *selection {
+                        FlycompPromptSelection::Yes if show_files => {
+                            FlycompPromptSelection::ShowFiles
+                        }
                         FlycompPromptSelection::Yes => FlycompPromptSelection::No,
-                        FlycompPromptSelection::No => FlycompPromptSelection::DontAsk,
+                        FlycompPromptSelection::No | FlycompPromptSelection::ShowFiles => {
+                            FlycompPromptSelection::DontAsk
+                        }
                         FlycompPromptSelection::DontAsk => FlycompPromptSelection::Yes,
                     };
                 }
@@ -337,6 +345,7 @@ impl KeyEventAction {
                     request,
                     selection,
                     sandbox,
+                    fallback,
                     ..
                 } = mode
                 {
@@ -353,8 +362,16 @@ impl KeyEventAction {
                             );
                         }
                         FlycompPromptSelection::No => {}
+                        FlycompPromptSelection::ShowFiles => {
+                            if let Some(fallback) = fallback {
+                                app.show_preserved_tab_completion(fallback);
+                            }
+                        }
                         FlycompPromptSelection::DontAsk => {
                             app.settings.flycomp_blacklist.insert(command_word);
+                            if let Some(fallback) = fallback {
+                                app.show_preserved_tab_completion(fallback);
+                            }
                         }
                     }
                 }

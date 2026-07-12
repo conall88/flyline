@@ -7,7 +7,9 @@ use crate::active_suggestions::{
     ActiveSuggestions, ActiveSuggestionsBuilder, FlycompRequest, ProcessedSuggestion,
     SuggestionDescription, UnprocessedSuggestion,
 };
-use crate::app::{App, ContentMode, FlycompPromptSelection, TabCompletionHandle};
+use crate::app::{
+    App, ContentMode, FlycompPromptSelection, PreservedTabCompletion, TabCompletionHandle,
+};
 use crate::bash_funcs::{CompletionFlags, QuoteType};
 use crate::content_utils::{self, ansi_string_to_spans};
 use crate::globbing::PathPatternExpansion;
@@ -253,6 +255,10 @@ fn flycomp_request_for_native_result(
     } else {
         None
     }
+}
+
+fn should_preserve_fallback(builder: &ActiveSuggestionsBuilder, request: FlycompRequest) -> bool {
+    request == FlycompRequest::InstallCompletionScript && !builder.is_empty()
 }
 
 /// Whether the word under the cursor is an option-name candidate rather than a
@@ -1255,6 +1261,33 @@ impl App<'_> {
             }
         }
     }
+
+    pub(crate) fn show_preserved_tab_completion(&mut self, mut fallback: PreservedTabCompletion) {
+        // The request has been resolved by the user's choice; the suggestion
+        // builder must now follow the normal manual-completion path.
+        fallback.builder.flycomp_request = None;
+        match apply_tab_complete_to_buffer(
+            &mut self.buffer,
+            &fallback.builder,
+            &fallback.wuc_substring,
+        ) {
+            TabCompleteBufferOutcome::SoloAccepted => {
+                self.content_mode = ContentMode::Normal;
+            }
+            TabCompleteBufferOutcome::Pending { final_wuc } => {
+                let suggestions = ActiveSuggestions::new(
+                    fallback.builder,
+                    final_wuc,
+                    fallback.load_time,
+                    false,
+                    self.settings.suggestion_sort_order,
+                    self.settings.fuzzy_mode,
+                );
+                self.content_mode = ContentMode::TabCompletion(Box::new(suggestions));
+            }
+        }
+    }
+
     /// Apply the results of tab completion generation (Phase 2 & 3: common
     /// prefix insertion and handing suggestions to the UI).
     pub fn finish_tab_complete(
@@ -1292,17 +1325,33 @@ impl App<'_> {
             };
             let context_before_word = context_before_word(&completion_context).to_string();
             let buffer_snapshot = self.buffer.buffer().to_string();
+            let word_under_cursor = wuc_substring.s.clone();
+            // A non-empty builder paired with script installation is the
+            // generic fallback case: zsh produced files even though it found
+            // no command-specific completion route. Keep those files available
+            // if the user declines synthesis. Option synthesis intentionally
+            // has no fallback because it only runs from an empty native result.
+            let fallback = if should_preserve_fallback(&builder, request) {
+                Some(PreservedTabCompletion {
+                    builder,
+                    wuc_substring,
+                    load_time,
+                })
+            } else {
+                None
+            };
 
             self.content_mode = ContentMode::TabCompletionAskForFlycomp {
                 command_word,
                 command_identity,
-                word_under_cursor: wuc_substring.s.clone(),
+                word_under_cursor,
                 context_before_word,
                 buffer_snapshot,
                 request,
                 selection: FlycompPromptSelection::Yes,
                 sandbox,
                 dump_path,
+                fallback,
             };
             return;
         }
@@ -1681,6 +1730,13 @@ mod tab_completion_tests {
             flycomp_request_for_native_result(Some(false), true, gate),
             Some(FlycompRequest::InstallCompletionScript)
         );
+        // zsh's generic `_default`/`_files` fallback can return filenames even
+        // though no command-specific completion route exists. The same manual
+        // request must still prompt for script synthesis.
+        assert_eq!(
+            flycomp_request_for_native_result(Some(false), false, gate),
+            Some(FlycompRequest::InstallCompletionScript)
+        );
         assert_eq!(
             flycomp_request_for_native_result(Some(true), true, gate),
             Some(FlycompRequest::SuggestOptions)
@@ -1690,6 +1746,27 @@ mod tab_completion_tests {
             None
         );
         assert_eq!(flycomp_request_for_native_result(None, true, gate), None);
+    }
+
+    #[test]
+    fn only_script_installation_preserves_nonempty_fallback_candidates() {
+        let builder = ActiveSuggestionsBuilder::from_processed([ProcessedSuggestion::new(
+            "Cargo.toml",
+            "",
+            "",
+        )]);
+        assert!(should_preserve_fallback(
+            &builder,
+            FlycompRequest::InstallCompletionScript
+        ));
+        assert!(!should_preserve_fallback(
+            &builder,
+            FlycompRequest::SuggestOptions
+        ));
+        assert!(!should_preserve_fallback(
+            &ActiveSuggestionsBuilder::new(),
+            FlycompRequest::InstallCompletionScript
+        ));
     }
 
     /// Locate a test fixture directory by trying multiple paths:

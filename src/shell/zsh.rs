@@ -22,9 +22,10 @@ const FLYBEGIN: &str = "<<FLYBEGIN>>";
 const FLYEND: &str = "<<FLYEND>>";
 const FLYCD: &str = "<<FLYCD>>";
 const FLYRELOAD: &str = "<<FLYRELOAD>>";
-/// Marker whose payload is `$_comps[<cmd>]`: non-empty means a native completion
-/// function is registered for the command word (even if it produced no matches).
-const FLYCOMPDEF: &str = "<<FLYCOMPDEF>>";
+/// Marker emitted before capture candidates. Its `1` payload means zsh found a
+/// command-specific route (direct, pattern, or post-pattern) before falling
+/// back to the generic `-default-` completer.
+const FLYSPECIFIC: &str = "<<FLYSPECIFIC>>";
 
 /// First line of a broker request that asks the daemon to (re)load a completion
 /// function instead of capturing completions. A real cwd never starts with this.
@@ -573,10 +574,10 @@ impl ZshBackend {
         Ok(())
     }
 
-    /// Capture completions plus whether a native completer is registered for the
-    /// command word (`has_completer`), used to keep flyline from offering to
-    /// synthesize a completion when one already exists but simply had nothing to
-    /// add (e.g. `kubectl get` with no reachable cluster).
+    /// Capture completions plus whether zsh selected a command-specific route.
+    /// This lets flyline distinguish a native completer that returned nothing
+    /// (e.g. `kubectl get` with no reachable cluster) from `_default`/`_files`
+    /// fallback candidates.
     fn capture_completions(
         &self,
         full_command: &str,
@@ -587,7 +588,10 @@ impl ZshBackend {
             .unwrap_or(full_command);
         // Fast path: the shared broker (daemon booted once, reused across prompts).
         if let Some(blob) = broker_capture(&self.cwd(), buffer_at_cursor) {
-            return Ok((parse_capture_output(&blob), capture_has_completer(&blob)));
+            return Ok((
+                parse_capture_output(&blob),
+                capture_has_specific_completer(&blob),
+            ));
         }
         // Fail-open: per-process in-process daemon (original behaviour).
         self.ensure_comp_daemon()?;
@@ -598,7 +602,7 @@ impl ZshBackend {
         let output = daemon.capture(buffer_at_cursor)?;
         Ok((
             parse_capture_output(&output),
-            capture_has_completer(&output),
+            capture_has_specific_completer(&output),
         ))
     }
 }
@@ -768,17 +772,17 @@ impl ShellBackend for ZshBackend {
         cursor_byte_pos: usize,
         _word_under_cursor_byte_end: usize,
     ) -> anyhow::Result<ProgrammableCompleteReturn> {
-        let (pairs, has_completer) = self.capture_completions(full_command, cursor_byte_pos)?;
+        let (pairs, has_specific_completer) =
+            self.capture_completions(full_command, cursor_byte_pos)?;
         let completions = pairs_to_completion_strings(&pairs);
         let mut flags = CompletionFlags::default();
         flags.quote_type = find_quote_type(word_under_cursor);
         flags.some_dont_end_in_equal_sign = completions.iter().any(|s| !s.ends_with('='));
-        // A registered completer that ran but produced nothing (e.g. `kubectl get`
-        // with no reachable cluster) still counts as "useful": flyline should fall
-        // silent like cobra/fig/carapace rather than offering to synthesize a
-        // completion (which can't know cluster state anyway). Only a command with
-        // no completer at all is treated as useless, which triggers the flycomp prompt.
-        let compspec_was_useful = !completions.is_empty() || has_completer;
+        // Generic `_default`/`_files` fallback can yield a non-empty directory
+        // listing even though zsh has no command-specific completer. Only a
+        // specific route counts as useful, so manual completion can offer
+        // flycomp while retaining those fallback files for the user.
+        let compspec_was_useful = has_specific_completer;
         Ok(ProgrammableCompleteReturn::new(
             completions,
             flags,
@@ -1020,8 +1024,8 @@ pub fn parse_capture_output(blob: &str) -> Vec<(String, Option<String>)> {
         if line.contains(FLYEND) {
             break;
         }
-        // The completer-registration marker is metadata, not a completion value.
-        if line.contains(FLYCOMPDEF) {
+        // The completion-route marker is metadata, not a completion value.
+        if line.contains(FLYSPECIFIC) {
             continue;
         }
         if inside && !line.is_empty() {
@@ -1045,15 +1049,13 @@ pub fn parse_capture_output(blob: &str) -> Vec<(String, Option<String>)> {
     out
 }
 
-/// Whether the daemon reported a native completion function for the command word
-/// (the `<<FLYCOMPDEF>>` marker carries `$_comps[cmd]`; a non-empty payload means
-/// a completer is registered). Lets the backend distinguish "a completer ran but
-/// had nothing to add" (stay silent) from "no completer exists" (offer flycomp).
-pub fn capture_has_completer(blob: &str) -> bool {
+/// Whether the daemon reported that zsh selected a command-specific completion
+/// route rather than only the generic `-default-` fallback.
+pub fn capture_has_specific_completer(blob: &str) -> bool {
     blob.lines().any(|line| {
-        line.trim_end_matches('\r')
-            .strip_prefix(FLYCOMPDEF)
-            .is_some_and(|rest| !rest.trim().is_empty())
+        let line = line.trim_end_matches('\r');
+        line.find(FLYSPECIFIC)
+            .is_some_and(|start| line[start + FLYSPECIFIC.len()..].trim() == "1")
     })
 }
 
@@ -1250,7 +1252,7 @@ fn broker_socket_path() -> Option<PathBuf> {
 }
 
 /// Capture `buffer_at_cursor` in `cwd` via the broker, returning the raw daemon
-/// blob (parsed by the caller so it can also read the `<<FLYCOMPDEF>>` marker).
+/// blob (parsed by the caller so it can also read the `<<FLYSPECIFIC>>` marker).
 /// `None` (→ in-process fallback) when disabled, unreachable, or the reply is
 /// malformed; a valid empty capture still returns `Some(blob)` so we don't
 /// redundantly re-capture in-process.
@@ -1701,6 +1703,10 @@ mod tests {
             "expected git subcommand in {:?}",
             result.completions.iter().take(5).collect::<Vec<_>>(),
         );
+        assert!(
+            result.compspec_was_useful,
+            "git's command-specific zsh completion route should be useful"
+        );
     }
 
     /// When the daemon loads a user rc that sources
@@ -1903,21 +1909,106 @@ mod tests {
     }
 
     #[test]
-    fn capture_has_completer_detects_registration() {
-        let registered = "<<FLYBEGIN>>\nget -- Display\n<<FLYCOMPDEF>>_kubectl\n<<FLYEND>>\n";
-        assert!(capture_has_completer(registered));
-        let empty_payload = "<<FLYBEGIN>>\n<<FLYCOMPDEF>>\n<<FLYEND>>\n";
-        assert!(!capture_has_completer(empty_payload));
+    fn capture_has_specific_completer_detects_route() {
+        let registered = "<<FLYSPECIFIC>>1\n<<FLYBEGIN>>\nget -- Display\n<<FLYEND>>\n";
+        assert!(capture_has_specific_completer(registered));
+        let generic = "<<FLYSPECIFIC>>0\n<<FLYBEGIN>>\nfile\n<<FLYEND>>\n";
+        assert!(!capture_has_specific_completer(generic));
         let no_marker = "<<FLYBEGIN>>\nfoo\n<<FLYEND>>\n";
-        assert!(!capture_has_completer(no_marker));
+        assert!(!capture_has_specific_completer(no_marker));
+        let malformed = "<<FLYSPECIFIC>>yes\n<<FLYBEGIN>>\nfoo\n<<FLYEND>>\n";
+        assert!(!capture_has_specific_completer(malformed));
     }
 
     #[test]
-    fn parse_capture_output_ignores_compdef_marker() {
-        let blob = "<<FLYBEGIN>>\nget -- Display a resource\n<<FLYCOMPDEF>>_kubectl\n<<FLYEND>>\n";
+    fn parse_capture_output_ignores_specific_route_marker() {
+        let blob = "<<FLYSPECIFIC>>1\n<<FLYBEGIN>>\nget -- Display a resource\n<<FLYEND>>\n";
         assert_eq!(
             parse_capture_output(blob),
             vec![("get".to_string(), Some("Display a resource".to_string()))],
+        );
+    }
+
+    #[test]
+    fn daemon_distinguishes_specific_routes_from_generic_file_fallback() {
+        if !zsh_available() || no_rcs() {
+            eprintln!("skipping zsh route capture: zsh unavailable or rcs disabled");
+            return;
+        }
+
+        let stamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let zdotdir =
+            std::env::temp_dir().join(format!("flyline-zsh-routes-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&zdotdir).unwrap();
+        std::fs::write(
+            zdotdir.join(".zshrc"),
+            r#"
+autoload -Uz compinit
+compinit -i
+_flyline_empty() { return 1 }
+_flyline_files() { _files }
+compdef _flyline_empty flyline-direct-empty
+compdef _flyline_files flyline-direct-files
+compdef -p _flyline_empty 'flyline-pattern-*'
+compdef -P _flyline_empty 'flyline-post-pattern-*'
+compdef flyline-service=flyline-direct-empty
+"#,
+        )
+        .unwrap();
+
+        let script_path = ZSH_BACKEND.daemon_script_path().to_path_buf();
+        let zdotdir_str = zdotdir.to_string_lossy().into_owned();
+        let results = {
+            let mut daemon =
+                spawn_comp_daemon_with_env(&script_path, &[("ZDOTDIR", zdotdir_str.as_str())])
+                    .expect("spawn completion daemon");
+            [
+                (
+                    "direct empty",
+                    daemon.capture("flyline-direct-empty ").unwrap(),
+                ),
+                (
+                    "direct files",
+                    daemon.capture("flyline-direct-files ").unwrap(),
+                ),
+                (
+                    "pattern route",
+                    daemon.capture("flyline-pattern-match ").unwrap(),
+                ),
+                (
+                    "post-pattern route",
+                    daemon.capture("flyline-post-pattern-match ").unwrap(),
+                ),
+                ("service route", daemon.capture("flyline-service ").unwrap()),
+                (
+                    "generic fallback",
+                    daemon.capture("flyline-no-route ").unwrap(),
+                ),
+            ]
+        };
+        let _ = std::fs::remove_dir_all(&zdotdir);
+
+        for (label, blob) in &results[..5] {
+            assert!(
+                capture_has_specific_completer(blob),
+                "{label} should report a command-specific route: {blob:?}"
+            );
+        }
+        assert!(
+            !capture_has_specific_completer(&results[5].1),
+            "generic fallback must not be reported as command-specific: {:?}",
+            results[5].1
+        );
+        assert!(
+            !parse_capture_output(&results[1].1).is_empty(),
+            "a specific completion that calls _files should still return files"
+        );
+        assert!(
+            !parse_capture_output(&results[5].1).is_empty(),
+            "generic fallback should capture the files preserved for the prompt"
         );
     }
 
@@ -2032,12 +2123,12 @@ mod tests {
             "expected synthesized subcommands, got {values:?}"
         );
         assert!(
-            capture_has_completer(&resp),
-            "registered _flytest should be reported as a completer, got: {resp:?}"
+            capture_has_specific_completer(&resp),
+            "registered _flytest should be reported as a specific route, got: {resp:?}"
         );
 
-        // A command with no registered completer must not report one — that's the
-        // signal that keeps flyline from offering flycomp only when nothing exists.
+        // A command with no command-specific route must report generic fallback
+        // even if zsh produced filename candidates.
         let mut stream = connect().expect("connect for unknown-cmd capture");
         stream
             .set_read_timeout(Some(BROKER_REQUEST_TIMEOUT))
@@ -2050,8 +2141,8 @@ mod tests {
         let mut resp2 = String::new();
         stream.read_to_string(&mut resp2).unwrap();
         assert!(
-            !capture_has_completer(&resp2),
-            "unregistered command should not report a completer, got: {resp2:?}"
+            !capture_has_specific_completer(&resp2),
+            "unregistered command should not report a specific route, got: {resp2:?}"
         );
 
         let _ = std::fs::remove_file(&sock);

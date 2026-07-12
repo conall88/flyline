@@ -79,6 +79,7 @@ pub enum TagPattern {
     Ps1PromptCwd,
     FlycompYes,
     FlycompNo,
+    FlycompShowFiles,
     FlycompDontAsk,
     RightClickCopy,
     RightClickCut,
@@ -108,6 +109,7 @@ impl TagPattern {
             (TagPattern::Ps1PromptCwd, Some(Tag::Ps1PromptCwdWidget(_))) => true,
             (TagPattern::FlycompYes, Some(Tag::FlycompYes)) => true,
             (TagPattern::FlycompNo, Some(Tag::FlycompNo)) => true,
+            (TagPattern::FlycompShowFiles, Some(Tag::FlycompShowFiles)) => true,
             (TagPattern::FlycompDontAsk, Some(Tag::FlycompDontAsk)) => true,
             (TagPattern::RightClickCopy, Some(Tag::RightClickCopy)) => true,
             (TagPattern::RightClickCut, Some(Tag::RightClickCut)) => true,
@@ -369,6 +371,7 @@ pub enum MouseEventAction {
     ClickPromptCopyBuffer,
     FlycompSelectYes,
     FlycompSelectNo,
+    FlycompSelectShowFiles,
     FlycompSelectDontAsk,
     HoverSuggestion,
     HoverHistoryResult,
@@ -523,6 +526,11 @@ pub static DEFAULT_MOUSE_BINDINGS: LazyLock<Vec<MouseBinding>> = LazyLock::new(|
             context: MouseContextVar::TabCompletionAskForFlycomp
                 + MouseContextVar::OverCellSemantically(TagPattern::FlycompNo),
             action: MouseEventAction::FlycompSelectNo,
+        },
+        MouseBinding {
+            context: MouseContextVar::TabCompletionAskForFlycomp
+                + MouseContextVar::OverCellSemantically(TagPattern::FlycompShowFiles),
+            action: MouseEventAction::FlycompSelectShowFiles,
         },
         MouseBinding {
             context: MouseContextVar::TabCompletionAskForFlycomp
@@ -1176,6 +1184,29 @@ impl MouseEventAction {
                     MouseActionOutput::dont_update()
                 }
             }
+            MouseEventAction::FlycompSelectShowFiles => {
+                if let ContentMode::TabCompletionAskForFlycomp {
+                    ref mut selection, ..
+                } = app.content_mode
+                {
+                    *selection = FlycompPromptSelection::ShowFiles;
+                    if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+                        let mode = std::mem::replace(&mut app.content_mode, ContentMode::Normal);
+                        if let ContentMode::TabCompletionAskForFlycomp {
+                            fallback: Some(fallback),
+                            ..
+                        } = mode
+                        {
+                            app.show_preserved_tab_completion(fallback);
+                        }
+                        MouseActionOutput::update_now()
+                    } else {
+                        MouseActionOutput::dont_update()
+                    }
+                } else {
+                    MouseActionOutput::dont_update()
+                }
+            }
             MouseEventAction::FlycompSelectDontAsk => {
                 if let ContentMode::TabCompletionAskForFlycomp {
                     ref mut selection, ..
@@ -1184,8 +1215,16 @@ impl MouseEventAction {
                     *selection = FlycompPromptSelection::DontAsk;
                     if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
                         let mode = std::mem::replace(&mut app.content_mode, ContentMode::Normal);
-                        if let ContentMode::TabCompletionAskForFlycomp { command_word, .. } = mode {
+                        if let ContentMode::TabCompletionAskForFlycomp {
+                            command_word,
+                            fallback,
+                            ..
+                        } = mode
+                        {
                             app.settings.flycomp_blacklist.insert(command_word);
+                            if let Some(fallback) = fallback {
+                                app.show_preserved_tab_completion(fallback);
+                            }
                         }
                         MouseActionOutput::update_now()
                     } else {

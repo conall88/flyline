@@ -935,6 +935,7 @@ impl<'a> App<'a> {
                 sandbox,
                 dump_path,
                 request,
+                fallback,
                 ..
             } if self.mode.is_running() => {
                 content.newline();
@@ -980,6 +981,12 @@ impl<'a> App<'a> {
                 content.write_tagged_span(&TaggedSpan::new(
                     Span::styled(
                         match request {
+                            FlycompRequest::InstallCompletionScript if fallback.is_some() => {
+                                format!(
+                                    "Only generic file completions were found for '{}'. Run ",
+                                    command_word
+                                )
+                            }
                             FlycompRequest::InstallCompletionScript => {
                                 format!("No completion script found for '{}'. Run ", command_word)
                             }
@@ -1071,19 +1078,33 @@ impl<'a> App<'a> {
 
                 content.write_tagged_span(&TaggedSpan::new(Span::raw(" "), Tag::Normal));
 
-                // No button
-                let no_style = if *selection == FlycompPromptSelection::No {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Red)
-                        .add_modifier(Modifier::BOLD)
+                if fallback.is_some() {
+                    let show_files_style = if *selection == FlycompPromptSelection::ShowFiles {
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Red)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Red)
+                    };
+                    content.write_tagged_span(&TaggedSpan::new(
+                        Span::styled(" [Show files] ", show_files_style),
+                        Tag::FlycompShowFiles,
+                    ));
                 } else {
-                    Style::default().fg(Color::Red)
-                };
-                content.write_tagged_span(&TaggedSpan::new(
-                    Span::styled(" [No] ", no_style),
-                    Tag::FlycompNo,
-                ));
+                    let no_style = if *selection == FlycompPromptSelection::No {
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Red)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Red)
+                    };
+                    content.write_tagged_span(&TaggedSpan::new(
+                        Span::styled(" [No] ", no_style),
+                        Tag::FlycompNo,
+                    ));
+                }
 
                 content.write_tagged_span(&TaggedSpan::new(Span::raw(" "), Tag::Normal));
 
@@ -1097,7 +1118,14 @@ impl<'a> App<'a> {
                     Style::default().fg(Color::Red)
                 };
                 content.write_tagged_span(&TaggedSpan::new(
-                    Span::styled(" [No, don't ask again] ", dont_ask_style),
+                    Span::styled(
+                        if fallback.is_some() {
+                            " [Don't ask again] "
+                        } else {
+                            " [No, don't ask again] "
+                        },
+                        dont_ask_style,
+                    ),
                     Tag::FlycompDontAsk,
                 ));
                 content.newline();
