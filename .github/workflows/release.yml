@@ -568,9 +568,31 @@ jobs:
         run: |
           set -euo pipefail
 
-          # GitHub-generated changelog notes (best-effort).
-          generated="$(gh api "repos/${REPO}/releases/generate-notes" \
-            -f tag_name="$TAG" -q '.body' 2>/dev/null || true)"
+          # Generate a changelog only against the previous product release.
+          # Documentation assets use their own `assets` release/tag and must
+          # never become the comparison base for a multishell release.
+          previous_tag=""
+          while IFS= read -r candidate; do
+            case "$candidate" in
+              multishell-v*)
+                if [ "$candidate" != "$TAG" ]; then
+                  previous_tag="$candidate"
+                  break
+                fi
+                ;;
+            esac
+          done <<EOF
+          $(gh release list --repo "$REPO" --limit 100 --json tagName,isDraft \
+            --jq '.[] | select(.isDraft == false) | .tagName')
+          EOF
+
+          generated=""
+          if [ -n "$previous_tag" ]; then
+            generated="$(gh api "repos/${REPO}/releases/generate-notes" \
+              -f tag_name="$TAG" \
+              -f previous_tag_name="$previous_tag" \
+              -q '.body' 2>/dev/null || true)"
+          fi
 
           {
             echo "## flyline-multishell $TAG"
