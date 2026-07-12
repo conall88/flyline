@@ -43,14 +43,18 @@ Flyline is similar to [ble.sh](https://github.com/akinomyoga/ble.sh) but is writ
 > [!IMPORTANT]
 > After installing, run `flyline run-tutorial` and if you don't like the mouse capturing: `flyline mouse --mode disabled`
 
-### Quick install: `install.sh`
+### Install the latest release (recommended)
 
 > [!TIP]
-> Run the following command to download flyline and update your `.bashrc` to load the latest version. No need for `sudo`!
+> The release installer selects the correct archive, verifies its checksum, and
+> configures every supported shell it detects. No `sudo` is required.
 
 ```bash
 curl -sSfL https://github.com/conall88/flyline-multishell/releases/latest/download/install.sh | sh
 ```
+You can also choose a specific version or inspect its assets on the
+[releases page](https://github.com/conall88/flyline-multishell/releases).
+
 On macOS, zsh works with the system shell. To use the Bash builtin too, install
 a newer Bash that supports custom builtins: `brew install bash`.
 
@@ -106,18 +110,41 @@ Arch users can install the [AUR package](https://aur.archlinux.org/packages/flyl
 paru -S flyline
 ```
 
-### Download from releases
+### Manual installation from a release
 
-Download the `libflyline-multishell-vX.Y.Z-<target>.tar.gz` archive and matching
-`.sha256` file for your system from [the releases page](https://github.com/conall88/flyline-multishell/releases),
-verify the checksum, and extract the archive. On Linux, you probably want the
-`gnu` target unless you use a `musl`-based distribution such as Alpine or
-Chimera. Then, in your `.bashrc` (or current Bash session), load the extracted
-versioned library:
+Each release provides a `libflyline-multishell-vX.Y.Z-<target>.tar.gz` archive
+and matching `.sha256` file. Download both from the
+[releases page](https://github.com/conall88/flyline-multishell/releases), verify
+the checksum, and extract the archive into a directory such as
+`~/.local/lib`. On Linux, choose a `gnu` target unless you use a `musl`-based
+distribution such as Alpine or Chimera.
+
+The same archive supports both shells:
+
+- `libflyline.so.X.Y.Z` (or `libflyline.dylib.X.Y.Z` on macOS) is the Bash
+  loadable builtin.
+- `flyline-standalone` and `scripts/flyline.zsh` provide the zsh integration.
+
+For Bash, load the extracted versioned library from `.bashrc` or the current
+session:
+
 ```bash
-enable -f /path/to/libflyline.so.X.Y.Z flyline
+enable -f "$HOME/.local/lib/libflyline.so.X.Y.Z" flyline
 flyline run-tutorial
 ```
+
+For zsh, make the standalone binary executable and add the integration to
+`.zshrc`:
+
+```zsh
+chmod +x "$HOME/.local/lib/flyline-standalone"
+export FLYLINE_BIN="$HOME/.local/lib/flyline-standalone"
+[[ -r "$HOME/.local/lib/scripts/flyline.zsh" ]] && . "$HOME/.local/lib/scripts/flyline.zsh"
+flyline run-tutorial
+```
+
+The installer above performs these steps automatically and is the preferred
+way to install or upgrade from a release.
 
 
 ### Build from source
