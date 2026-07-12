@@ -568,6 +568,19 @@ jobs:
         run: |
           set -euo pipefail
 
+          # The embedded changelog is the source of truth for user-facing
+          # changes. GitHub's generated notes omit direct-to-master commits, so
+          # require and include the section for this exact fork version.
+          changelog="$(awk -v "heading=## v${VERSION}" '
+            $0 == heading { capture = 1; next }
+            capture && /^## / { exit }
+            capture { print }
+          ' src/changelog.rs)"
+          if [ -z "$changelog" ]; then
+            echo "::error::src/changelog.rs has no '## v${VERSION}' section"
+            exit 1
+          fi
+
           # Generate a changelog only against the previous product release.
           # Documentation assets use their own `assets` release/tag and must
           # never become the comparison base for a multishell release.
@@ -600,6 +613,10 @@ jobs:
             echo "Multishell fork of flyline (\`${VERSION}\`). This release bundles the Bash"
             echo "loadable builtin **and** the standalone \`flyline-standalone\` binary used by"
             echo "the zsh integration, for every supported target."
+            echo ""
+            echo "## Changelog"
+            echo ""
+            echo "$changelog"
             echo ""
             echo "**Upstream base**"
             echo ""
