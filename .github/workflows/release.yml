@@ -262,6 +262,21 @@ jobs:
           toolchain: 1.96.0
           targets: ${{ matrix.target }}
 
+      # Profiled multishell-v1.1.1 release (~428s wall): the 12-target build
+      # matrix dominates (~219s); within a typical job Rust compile is ~171s of
+      # ~194s. Share registry/git downloads across targets; cache compiled
+      # target/<triple>/ artifacts per matrix row (Cargo.lock + rustc 1.96.0 +
+      # target + feature suffix). Full rebuild + installer tests still run every
+      # release; this only skips redundant dependency compilation on reruns.
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        with:
+          shared-key: release
+          prefix-key: release-${{ matrix.target }}${{ matrix.suffix }}-1.96.0
+          cache-targets: true
+          cache-on-failure: true
+          save-if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/multishell-v') }}
+
       - name: Install cross
         if: matrix.build_tool == 'cross'
         uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145 # v2
