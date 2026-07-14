@@ -2148,4 +2148,100 @@ compdef flyline-service=flyline-direct-empty
         let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_dir_all(&comp_dir);
     }
+
+    /// Regression: deferred-compinit frameworks (znap, zinit, zplug) replace
+    /// `compdef` with a stub that only queues definitions until their own
+    /// compinit re-runs. The `fly-reload` widget's `compdef` call then registers
+    /// nothing, so the immediate re-capture still sees no command-specific route
+    /// and flyline re-offers flycomp forever (the reported bug). The widget also
+    /// binds `_comps` directly, so the route must be detected even when `compdef`
+    /// is stubbed. This rc mirrors znap's init: a real compinit to populate
+    /// `_comps`, then `compdef`/`compinit` replaced by no-op/queue stubs.
+    #[test]
+    fn reload_registers_completer_under_stubbed_compdef() {
+        if !zsh_available() {
+            eprintln!("skipping stubbed-compdef reload: zsh not available");
+            return;
+        }
+        if no_rcs() {
+            eprintln!("skipping stubbed-compdef reload: FLYLINE_ZSH_NO_RCS set");
+            return;
+        }
+        let stamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let zdotdir =
+            std::env::temp_dir().join(format!("flyline-znap-{}-{}", std::process::id(), stamp));
+        std::fs::create_dir_all(&zdotdir).expect("create scratch ZDOTDIR");
+        let dump = zdotdir.join(".zcompdump");
+        std::fs::write(
+            zdotdir.join(".zshrc"),
+            format!(
+                "autoload -Uz compinit\n\
+                 compinit -u -d {dump:?}\n\
+                 typeset -gHa _znap_compdef=()\n\
+                 compdef() {{ _znap_compdef+=( \"${{(j: :)${{(@q+)@}}}}\" ) }}\n\
+                 compinit() {{ : }}\n",
+            ),
+        )
+        .expect("write scratch znap-like .zshrc");
+
+        let comp_dir = std::env::temp_dir().join(format!(
+            "flyline-znap-comps-{}-{}",
+            std::process::id(),
+            stamp
+        ));
+        std::fs::create_dir_all(&comp_dir).unwrap();
+        let comp_file = comp_dir.join("_flytest");
+        std::fs::write(
+            &comp_file,
+            "#compdef flytest\n\
+             _flytest() { local -a s; s=(alpha beta gamma); _describe 'command' s }\n\
+             _flytest \"$@\"\n",
+        )
+        .unwrap();
+
+        let script_path = ZSH_BACKEND.daemon_script_path().to_path_buf();
+        let zdotdir_str = zdotdir.to_str().unwrap().to_string();
+        let comp_file_str = comp_file.to_string_lossy().into_owned();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        #[allow(clippy::disallowed_methods)]
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<(String, String)> {
+                let mut daemon =
+                    spawn_comp_daemon_with_env(&script_path, &[("ZDOTDIR", zdotdir_str.as_str())])?;
+                let reload = daemon.reload(&comp_file_str)?;
+                let capture = daemon.capture("flytest ")?;
+                Ok((reload, capture))
+            })();
+            let _ = tx.send(result);
+        });
+
+        let outcome = rx.recv_timeout(DAEMON_BOOT_TIMEOUT + Duration::from_secs(15));
+        let _ = std::fs::remove_dir_all(&zdotdir);
+        let _ = std::fs::remove_dir_all(&comp_dir);
+
+        let (reload, capture) = outcome
+            .expect("daemon reload/capture did not resolve in time")
+            .expect("daemon should boot, reload and capture under a znap-like rc");
+        assert!(
+            reload.contains(FLYRELOAD),
+            "reload not acknowledged, got: {reload:?}"
+        );
+        assert!(
+            capture_has_specific_completer(&capture),
+            "synthesized _flytest must register as a specific route even when \
+             compdef is a deferred-compinit stub, got: {capture:?}"
+        );
+        let values: Vec<String> = parse_capture_output(&capture)
+            .into_iter()
+            .map(|(v, _)| v)
+            .collect();
+        assert!(
+            values.iter().any(|v| v == "alpha"),
+            "expected synthesized subcommands after reload, got {values:?}"
+        );
+    }
 }
