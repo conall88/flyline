@@ -2,6 +2,9 @@ pub(crate) const CHANGELOG: &str = r#"# Changelog
 
 # flyline-multishell fork
 
+## v1.1.1
+- a2677e4 - Register synthesized completers immediately when plugin managers defer compdef, preventing flycomp from repeatedly prompting after generation. Fixes a flycomp suggestion loop when using znap.
+
 ## v1.1.0
 - **flycomp offers for uncompleted commands**: zsh Tab completion now tells apart "no completer at all" from "a command-specific completer that legitimately found nothing," using a new `<<FLYSPECIFIC>>` provenance marker from the completion daemon. Commands like `claude` that previously fell through to zsh's generic filename fallback (silently listing the current directory) now get the flycomp installation-synthesis offer instead, while commands with a real completer (e.g. `kubectl get` against no cluster) stay silent as before.
 - **Show files / Don't ask again**: The flycomp prompt shown for this generic fallback case adds two new options alongside the existing synthesis offer: **Show files** reveals the retained filename candidates without synthesizing anything, and **Don't ask again** blacklists the command and then shows those same files.
