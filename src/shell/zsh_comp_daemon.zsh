@@ -60,6 +60,13 @@ fly-reload () {
     unfunction "_$c" 2>/dev/null
     autoload -Uz -- "_$c" 2>/dev/null
     compdef "_$c" "$c" 2>/dev/null
+    # Deferred-compinit frameworks (znap, zinit, zplug) replace `compdef` with a
+    # stub that queues definitions until their own compinit re-runs, so the call
+    # above registers nothing now and the immediate re-capture would still see no
+    # completer — flyline then re-offers flycomp forever. Bind the completer in
+    # `_comps` directly too (compdef's core effect for a single function+command)
+    # so the next capture sees it regardless. Harmless when compdef already did it.
+    (( $+_comps )) && _comps[$c]="_$c"
   fi
   print -r -- '<<FLYRELOAD>>'
 }
